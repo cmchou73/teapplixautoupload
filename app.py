@@ -1,4 +1,4 @@
-# app1.py — Streamlit BOL 產生器（PO 搜尋→合併表；嚴格等於 OriginalTxnId 過濾）
+# app1.py — Streamlit BOL 產生器（UI 優化：抓取訂單移到側邊；PO 搜尋固定 14 天）
 import os
 import io
 import zipfile
@@ -215,13 +215,13 @@ def fetch_orders(days: int):
         page += 1
     return all_orders
 
-# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（帶 PaymentDateStart/End + 嚴格等於過濾） ----------
-def fetch_orders_by_pos(pos_list, shipped: str, days: int):
+# ---------- API：以 PO(OriginalTxnId) 查詢（固定最近 14 天 + 嚴格等於過濾） ----------
+def fetch_orders_by_pos(pos_list, shipped: str):
     """
-    每個 PO 發一個 GET；必帶 PaymentDateStart/End 以滿足最小查詢條件。
-    除了伺服器端參數外，額外在本機強制做「OriginalTxnId 嚴格等於」過濾，避免 API 回太多。
+    每個 PO 發一個 GET；固定附帶最近 14 天的 PaymentDate 範圍。
+    伺服器回傳後，於本機強制 OriginalTxnId 嚴格等於過濾。
     """
-    ps, pe = phoenix_range_days(days)
+    ps, pe = phoenix_range_days(14)  # ★ 固定 14 天
     results = []
     for oid in pos_list:
         oid = (oid or "").strip()
@@ -233,7 +233,7 @@ def fetch_orders_by_pos(pos_list, shipped: str, days: int):
             "Combine": "combine",
             "PageSize": str(PAGE_SIZE),
             "PageNumber": "1",
-            "OriginalTxnId": oid,       # 伺服器端過濾（有時會被忽略/模糊）
+            "OriginalTxnId": oid,
             "PaymentDateStart": ps,
             "PaymentDateEnd": pe,
         }
@@ -252,24 +252,17 @@ def fetch_orders_by_pos(pos_list, shipped: str, days: int):
 
         raw_orders = data.get("orders") or data.get("Orders") or []
 
-        # ---- 本機嚴格等於過濾（關鍵修正）----
-        exact = []
+        # 嚴格等於過濾 + 排除 UNSP_CG
         for o in raw_orders:
-            val = str(o.get("OriginalTxnId") or "").strip()
-            if val == oid:
-                exact.append(o)
-        # 排除 UNSP_CG
-        for o in exact:
-            od = o.get("OrderDetails") or {}
-            if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
-                results.append(o)
+            if str(o.get("OriginalTxnId") or "").strip() == oid:
+                od = o.get("OrderDetails") or {}
+                if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
+                    results.append(o)
 
-        # 偵錯訊息：如果伺服器回多但本機濾完 0，提示縮小時間/確認 PO
-        if raw_orders and not exact:
-            st.info(f"提示：API 在區間 {ps}~{pe} 回 {len(raw_orders)} 筆，但無『OriginalTxnId 等於 {oid}』資料。"
-                    f" 可嘗試縮小『抓取天數』或確認 PO 是否正確。")
+        if raw_orders and not any(str(o.get("OriginalTxnId") or "").strip() == oid for o in raw_orders):
+            st.info(f"提示：API 在最近 14 天回 {len(raw_orders)} 筆，但無『OriginalTxnId 等於 {oid}』資料。"
+                    f" 請確認 PO 是否正確或試著延長區間。")
 
-    # 若指定 shipped，再做一次本地過濾（不同租戶欄位大小寫可能不同）
     if shipped in ("0", "1"):
         results = [o for o in results if str(o.get("Shipped") or o.get("shipped") or "").strip() == shipped]
     return results
@@ -399,14 +392,18 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 抓取天數（同時供 PO 搜尋與一般抓單）
-days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
+# ---- 側邊：抓取天數 + 按鈕（搬到這裡） ----
+days = st.sidebar.selectbox("抓取天數（一般抓單）", options=[1,2,3,4,5,6,7], index=2, help="套用於『抓取訂單』")
+if st.sidebar.button("抓取訂單", width="stretch"):
+    st.session_state["orders_raw"] = fetch_orders(days)
+    st.session_state.pop("table_rows_override", None)
+    st.sidebar.success(f"已抓取最近 {days} 天的一般訂單。")
 
-# === 左側「以 PO 搜尋（每行一個）」 ===
+# ---- 側邊：以 PO 搜尋（固定 14 天） ----
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔎 以 PO 搜尋（每行一個）")
+st.sidebar.subheader("🔎 以 PO 搜尋（固定最近 14 天）")
 po_text = st.sidebar.text_area(
-    "輸入 PO（OriginalTxnId）",
+    "輸入 PO（每行一個；OriginalTxnId）",
     placeholder="例如：\n32585340\n46722012",
     height=120,
 )
@@ -414,9 +411,9 @@ shipped_choice = st.sidebar.selectbox(
     "出貨狀態（Shipped）",
     options=["不限", "未出貨(0)", "已出貨(1)"],
     index=0,
-    help="0 = 未出貨，1 = 已出貨",
+    help="0 = 未出貨，1 = 已出貨；不限則不帶此參數",
 )
-if st.sidebar.button("搜尋 PO", width="stretch"):
+if st.sidebar.button("搜尋 PO（14 天內）", width="stretch"):
     raw_lines = (po_text or "").splitlines()
     pos_list = [ln.strip() for ln in raw_lines if ln.strip()]
     if not pos_list:
@@ -426,23 +423,17 @@ if st.sidebar.button("搜尋 PO", width="stretch"):
         if shipped_choice.endswith("(0)"): shipped_val = "0"
         elif shipped_choice.endswith("(1)"): shipped_val = "1"
 
-        # 直接把 PO 搜尋結果餵給下方合併表
-        orders = fetch_orders_by_pos(pos_list, shipped_val, days)
+        orders = fetch_orders_by_pos(pos_list, shipped_val)  # ★ 不再依 days，固定 14 天
         st.session_state["orders_raw"] = orders
         st.session_state.pop("table_rows_override", None)
-        st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單（已做等於 {pos_list} 的嚴格過濾），"
+        st.success(f"PO 搜尋完成（14 天內）：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單，"
                    f"並依 PO 合併顯示於下方表格。")
-
-# 一般抓單
-if st.button("抓取訂單", width="stretch"):
-    st.session_state["orders_raw"] = fetch_orders(days)
-    st.session_state.pop("table_rows_override", None)
 
 # ======== 合併表（依 OriginalTxnId 合併） + 產 BOL ========
 orders_raw = st.session_state.get("orders_raw", None)
 
 def build_table_rows_from_orders(orders_raw):
-    grouped = group_by_original_txn(orders_raw)
+    grouped = group_by_original_txn(orders_raw or [])
     table_rows = []
     for oid, group in grouped.items():
         first = group[0]
@@ -543,4 +534,4 @@ if orders_raw:
             else:
                 st.warning("沒有產生任何檔案。")
 else:
-    st.info("請先按『抓取訂單』或使用左側『以 PO 搜尋』。")
+    st.info("請先在左側按『抓取訂單』或『搜尋 PO（14 天內）』。")
