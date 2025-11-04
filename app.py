@@ -1,8 +1,10 @@
-# app1.py — Streamlit BOL 產生器（含左側「以 PO 搜尋」）
-# 版本要點：
-# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限，使用 GET 查詢（不走 POST Submit）
-# - Header 加入 APIToken（避免 401 Missing APIToken）；若另外需要 Authorization，可在 .env 或 secrets 設定
-# - 所有 use_container_width 改為 width="stretch"（相容 2026 之後）
+# app1.py — Streamlit BOL 產生器（含左側「以 PO 搜尋」, 帶時間範圍）
+# 更新要點：
+# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限
+# - ★ 依「抓取天數」帶入 PaymentDateStart / PaymentDateEnd，滿足 API 最小參數要求
+# - 查詢使用 GET，避免 POST Submit 導致 TxnId 必填
+# - Header 含 APIToken；如需 Authorization / x-api-key 可在 secrets 或 .env 設定
+# - Streamlit 全面改 width="stretch"
 
 import os
 import io
@@ -25,7 +27,7 @@ TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
-SHIPPED   = "0"     # 0 = 未出貨（一般抓單預設）
+SHIPPED_DEFAULT = "0"   # 一般抓單的預設（未出貨）
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -41,8 +43,9 @@ def _sec(name, default=""):
     return st.secrets.get(name, os.getenv(name, default))
 
 TEAPPLIX_TOKEN = _sec("TEAPPLIX_TOKEN", "")
-AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")  # 若你的租戶也需要 Authorization: Bearer，可設定此值
-X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")    # 若需要 x-api-key，可設定此值
+AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")  # 若你的租戶也需要 Authorization: Bearer，可設定
+X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")    # 若需要 x-api-key，可設定
+PASSWORD       = _sec("APP_PASSWORD", "")
 
 # UI 倉庫代號
 WAREHOUSES = {
@@ -62,18 +65,16 @@ WAREHOUSES = {
 
 # ---------- utils ----------
 def phoenix_range_days(days=3):
+    """回傳 Phoenix 時區的 [開始, 結束] ISO 字串（含當天 23:59:59）。"""
     tz = ZoneInfo("America/Phoenix")
     now = datetime.now(tz)
-    start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
     end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    start = (end - timedelta(days=days-1)).replace(hour=0, minute=0, second=0, microsecond=0)
     fmt = "%Y-%m-%dT%H:%M:%S"
     return start.strftime(fmt), end.strftime(fmt)
 
 def get_headers():
-    """
-    一些租戶只要 APIToken；有的同時要 Authorization Bearer / x-api-key。
-    這裡都支援，沒有就不送。
-    """
+    """依租戶需求帶入憑證。"""
     hdr = {
         "APIToken": TEAPPLIX_TOKEN,
         "Content-Type": "application/json;charset=UTF-8",
@@ -86,10 +87,8 @@ def get_headers():
     return hdr
 
 def oz_to_lb(oz):
-    try:
-        return round(float(oz)/16.0, 2)
-    except Exception:
-        return None
+    try: return round(float(oz)/16.0, 2)
+    except Exception: return None
 
 def summarize_packages(order):
     details = order.get("ShippingDetails") or []
@@ -146,10 +145,8 @@ def _sku8_from_order(order):
 
 def _qty_from_order(order):
     it = _first_item(order)
-    try:
-        return int(it.get("Quantity") or 0)
-    except Exception:
-        return 0
+    try: return int(it.get("Quantity") or 0)
+    except Exception: return 0
 
 def _sum_group_totals(group):
     total_pkgs = 0
@@ -210,7 +207,7 @@ def fetch_orders(days: int):
         params = {
             "PaymentDateStart": ps,
             "PaymentDateEnd": pe,
-            "Shipped": SHIPPED,
+            "Shipped": SHIPPED_DEFAULT,
             "StoreKey": STORE_KEY,
             "PageSize": str(PAGE_SIZE),
             "PageNumber": str(page),
@@ -241,14 +238,17 @@ def fetch_orders(days: int):
         page += 1
     return all_orders
 
-# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（關鍵：不走 POST Submit） ----------
-def fetch_orders_by_pos(pos_list, shipped: str):
+# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（帶 PaymentDateStart/End） ----------
+def fetch_orders_by_pos(pos_list, shipped: str, days: int):
     """
     以 OriginalTxnId(=PO) 清單查單；每個 PO 發一個 GET。
-    shipped: "0"=未出貨, "1"=已出貨, ""=不限
+    - 一律附帶 PaymentDateStart/End（依左側抓取天數）以滿足最小查詢條件。
+    - shipped: "0"=未出貨, "1"=已出貨, ""=不限
     回傳: list[order dict]
     """
+    ps, pe = phoenix_range_days(days)
     results = []
+
     for oid in pos_list:
         oid = (oid or "").strip()
         if not oid:
@@ -260,8 +260,12 @@ def fetch_orders_by_pos(pos_list, shipped: str):
             "Combine": "combine",
             "PageSize": str(PAGE_SIZE),
             "PageNumber": "1",
-            "OriginalTxnId": oid,   # 直接以 querystring 查 PO
+            "OriginalTxnId": oid,
+            # ★ 加入時間範圍，避免 "Minimum list of parameters" 400
+            "PaymentDateStart": ps,
+            "PaymentDateEnd": pe,
         }
+        # 若有指定 Shipped 就帶上（不限則不帶）
         if shipped in ("0", "1"):
             params["Shipped"] = shipped
 
@@ -396,10 +400,8 @@ def fill_pdf(row: dict, out_path: str):
             name = w.field_name
             if name and name in row:
                 set_widget_value(w, name, row[name])
-    try:
-        doc.need_appearances = True
-    except Exception:
-        pass
+    try: doc.need_appearances = True
+    except Exception: pass
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     doc.save(out_path, deflate=True, incremental=False, encryption=fitz.PDF_ENCRYPT_KEEP)
     doc.close()
@@ -408,14 +410,11 @@ def fill_pdf(row: dict, out_path: str):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # ---------- 密碼驗證 ----------
-PASSWORD = _sec("APP_PASSWORD", "")
 st.sidebar.subheader("🔐 驗證區")
 input_pwd = st.sidebar.text_input("請輸入密碼", type="password")
-
 if input_pwd != PASSWORD:
     st.warning("請輸入正確密碼後才能使用。")
     st.stop()
-# ---------- 密碼驗證 ----------
 
 st.title(APP_TITLE)
 
@@ -430,7 +429,7 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 左側 Sidebar：天數下拉
+# 左側 Sidebar：抓取天數（同時供 PO 搜尋與「抓取訂單」使用）
 days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
 # === 左側「以 PO 搜尋（每行一個）」 ===
@@ -459,7 +458,7 @@ if st.sidebar.button("搜尋 PO", width="stretch"):
         elif shipped_choice.endswith("(1)"):
             shipped_val = "1"
 
-        po_orders = fetch_orders_by_pos(pos_list, shipped_val)
+        po_orders = fetch_orders_by_pos(pos_list, shipped_val, days)
         st.session_state["po_search_results"] = po_orders
         st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，找到 {len(po_orders)} 筆訂單（含同 PO 多項）。")
 
