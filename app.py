@@ -1,4 +1,4 @@
-# app1.py — Streamlit BOL 產生器（PO 搜尋直接合併到下方表格；無上方預覽）
+# app1.py — Streamlit BOL 產生器（PO 搜尋→合併表；嚴格等於 OriginalTxnId 過濾）
 import os
 import io
 import zipfile
@@ -161,8 +161,7 @@ def _parse_order_date_str(first_order):
         first_order.get("CreateDate"),
     ]
     raw = next((v for v in candidates if v), None)
-    if not raw:
-        return ""
+    if not raw: return ""
     val = str(raw).strip()
     dt = None
     try:
@@ -216,11 +215,11 @@ def fetch_orders(days: int):
         page += 1
     return all_orders
 
-# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（帶 PaymentDateStart/End） ----------
+# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（帶 PaymentDateStart/End + 嚴格等於過濾） ----------
 def fetch_orders_by_pos(pos_list, shipped: str, days: int):
     """
     每個 PO 發一個 GET；必帶 PaymentDateStart/End 以滿足最小查詢條件。
-    shipped: "0"=未出貨, "1"=已出貨, ""=不限
+    除了伺服器端參數外，額外在本機強制做「OriginalTxnId 嚴格等於」過濾，避免 API 回太多。
     """
     ps, pe = phoenix_range_days(days)
     results = []
@@ -234,7 +233,7 @@ def fetch_orders_by_pos(pos_list, shipped: str, days: int):
             "Combine": "combine",
             "PageSize": str(PAGE_SIZE),
             "PageNumber": "1",
-            "OriginalTxnId": oid,
+            "OriginalTxnId": oid,       # 伺服器端過濾（有時會被忽略/模糊）
             "PaymentDateStart": ps,
             "PaymentDateEnd": pe,
         }
@@ -250,16 +249,32 @@ def fetch_orders_by_pos(pos_list, shipped: str, days: int):
             data = r.json()
         except Exception:
             st.error(f"PO {oid} 回傳非 JSON：{r.text[:400]}"); continue
-        orders = data.get("orders") or data.get("Orders") or []
-        for o in orders:
+
+        raw_orders = data.get("orders") or data.get("Orders") or []
+
+        # ---- 本機嚴格等於過濾（關鍵修正）----
+        exact = []
+        for o in raw_orders:
+            val = str(o.get("OriginalTxnId") or "").strip()
+            if val == oid:
+                exact.append(o)
+        # 排除 UNSP_CG
+        for o in exact:
             od = o.get("OrderDetails") or {}
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 results.append(o)
+
+        # 偵錯訊息：如果伺服器回多但本機濾完 0，提示縮小時間/確認 PO
+        if raw_orders and not exact:
+            st.info(f"提示：API 在區間 {ps}~{pe} 回 {len(raw_orders)} 筆，但無『OriginalTxnId 等於 {oid}』資料。"
+                    f" 可嘗試縮小『抓取天數』或確認 PO 是否正確。")
+
+    # 若指定 shipped，再做一次本地過濾（不同租戶欄位大小寫可能不同）
     if shipped in ("0", "1"):
         results = [o for o in results if str(o.get("Shipped") or o.get("shipped") or "").strip() == shipped]
     return results
 
-# ---------- PDF 填寫（略同前） ----------
+# ---------- PDF 填寫 ----------
 def set_widget_value(widget, name, value):
     try:
         is_checkbox_type  = (widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX)
@@ -411,11 +426,12 @@ if st.sidebar.button("搜尋 PO", width="stretch"):
         if shipped_choice.endswith("(0)"): shipped_val = "0"
         elif shipped_choice.endswith("(1)"): shipped_val = "1"
 
-        # 直接把 PO 搜尋結果餵給下方合併表（不顯示上方預覽）
+        # 直接把 PO 搜尋結果餵給下方合併表
         orders = fetch_orders_by_pos(pos_list, shipped_val, days)
         st.session_state["orders_raw"] = orders
         st.session_state.pop("table_rows_override", None)
-        st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單，已依 PO 合併顯示於下方表格。")
+        st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單（已做等於 {pos_list} 的嚴格過濾），"
+                   f"並依 PO 合併顯示於下方表格。")
 
 # 一般抓單
 if st.button("抓取訂單", width="stretch"):
