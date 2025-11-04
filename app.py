@@ -260,8 +260,7 @@ def fetch_orders_by_pos(pos_list, shipped: str):
                     results.append(o)
 
         if raw_orders and not any(str(o.get("OriginalTxnId") or "").strip() == oid for o in raw_orders):
-            st.info(f"提示：API 在最近 14 天回 {len(raw_orders)} 筆，但無『OriginalTxnId 等於 {oid}』資料。"
-                    f" 請確認 PO 是否正確或試著延長區間。")
+            st.info(f"提示：API 在最近 14 天回 {len(raw_orders)} 筆，但無『OriginalTxnId 等於 {oid}』資料。")
 
     if shipped in ("0", "1"):
         results = [o for o in results if str(o.get("Shipped") or o.get("shipped") or "").strip() == shipped]
@@ -401,9 +400,9 @@ if st.sidebar.button("抓取訂單", width="stretch"):
 
 # ---- 側邊：以 PO 搜尋（固定 14 天） ----
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔎 以 PO 搜尋（固定最近 14 天）")
+st.sidebar.subheader("🔎 PO 搜尋（最近 14 天）")
 po_text = st.sidebar.text_area(
-    "輸入 PO（每行一個；OriginalTxnId）",
+    "輸入 PO（每行一個）",
     placeholder="例如：\n32585340\n46722012",
     height=120,
 )
