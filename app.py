@@ -1,11 +1,4 @@
-# app1.py — Streamlit BOL 產生器（含左側「以 PO 搜尋」, 帶時間範圍）
-# 更新要點：
-# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限
-# - ★ 依「抓取天數」帶入 PaymentDateStart / PaymentDateEnd，滿足 API 最小參數要求
-# - 查詢使用 GET，避免 POST Submit 導致 TxnId 必填
-# - Header 含 APIToken；如需 Authorization / x-api-key 可在 secrets 或 .env 設定
-# - Streamlit 全面改 width="stretch"
-
+# app1.py — Streamlit BOL 產生器（PO 搜尋直接合併到下方表格；無上方預覽）
 import os
 import io
 import zipfile
@@ -27,7 +20,7 @@ TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
-SHIPPED_DEFAULT = "0"   # 一般抓單的預設（未出貨）
+SHIPPED_DEFAULT = "0"   # 一般抓單預設：未出貨
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -43,8 +36,8 @@ def _sec(name, default=""):
     return st.secrets.get(name, os.getenv(name, default))
 
 TEAPPLIX_TOKEN = _sec("TEAPPLIX_TOKEN", "")
-AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")  # 若你的租戶也需要 Authorization: Bearer，可設定
-X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")    # 若需要 x-api-key，可設定
+AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")
+X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")
 PASSWORD       = _sec("APP_PASSWORD", "")
 
 # UI 倉庫代號
@@ -65,7 +58,7 @@ WAREHOUSES = {
 
 # ---------- utils ----------
 def phoenix_range_days(days=3):
-    """回傳 Phoenix 時區的 [開始, 結束] ISO 字串（含當天 23:59:59）。"""
+    """回傳 Phoenix 時區的 [開始, 結束] ISO 字串（涵蓋 days 天到當日 23:59:59）。"""
     tz = ZoneInfo("America/Phoenix")
     now = datetime.now(tz)
     end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
@@ -74,7 +67,6 @@ def phoenix_range_days(days=3):
     return start.strftime(fmt), end.strftime(fmt)
 
 def get_headers():
-    """依租戶需求帶入憑證。"""
     hdr = {
         "APIToken": TEAPPLIX_TOKEN,
         "Content-Type": "application/json;charset=UTF-8",
@@ -157,8 +149,8 @@ def _sum_group_totals(group):
         total_lb   += float(lb or 0.0)
     return total_pkgs, int(round(total_lb))
 
-# 訂單時間：只顯示日期（mm/dd/yy）
 def _parse_order_date_str(first_order):
+    """只顯示日期（mm/dd/yy）"""
     tz_phx = ZoneInfo("America/Phoenix")
     od = first_order.get("OrderDetails") or {}
     candidates = [
@@ -172,7 +164,6 @@ def _parse_order_date_str(first_order):
     if not raw:
         return ""
     val = str(raw).strip()
-
     dt = None
     try:
         if "T" in val:
@@ -180,23 +171,17 @@ def _parse_order_date_str(first_order):
         else:
             for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
                 try:
-                    dt = datetime.strptime(val, fmt)
-                    break
-                except Exception:
-                    continue
+                    dt = datetime.strptime(val, fmt); break
+                except Exception: continue
     except Exception:
         dt = None
-
     if dt is None:
-        try:
-            dt = datetime.fromisoformat(val[:19])
-        except Exception:
-            return ""
-
+        try: dt = datetime.fromisoformat(val[:19])
+        except Exception: return ""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=tz_phx)
     dt_phx = dt.astimezone(tz_phx)
-    return dt_phx.strftime("%m/%d/%y")  # 僅日期
+    return dt_phx.strftime("%m/%d/%y")
 
 # ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
@@ -216,44 +201,33 @@ def fetch_orders(days: int):
         }
         r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
         if r.status_code != 200:
-            st.error(f"API 錯誤: {r.status_code}\n{r.text}")
-            break
+            st.error(f"API 錯誤: {r.status_code}\n{r.text}"); break
         try:
             data = r.json()
         except Exception:
-            st.error(f"JSON 解析錯誤：{r.text[:1000]}")
-            break
-
+            st.error(f"JSON 解析錯誤：{r.text[:1000]}"); break
         orders = data.get("orders") or data.get("Orders") or []
-        if not orders:
-            break
-
+        if not orders: break
         for o in orders:
             od = o.get("OrderDetails") or {}
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 all_orders.append(o)
-
-        if len(orders) < PAGE_SIZE:
-            break
+        if len(orders) < PAGE_SIZE: break
         page += 1
     return all_orders
 
 # ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（帶 PaymentDateStart/End） ----------
 def fetch_orders_by_pos(pos_list, shipped: str, days: int):
     """
-    以 OriginalTxnId(=PO) 清單查單；每個 PO 發一個 GET。
-    - 一律附帶 PaymentDateStart/End（依左側抓取天數）以滿足最小查詢條件。
-    - shipped: "0"=未出貨, "1"=已出貨, ""=不限
-    回傳: list[order dict]
+    每個 PO 發一個 GET；必帶 PaymentDateStart/End 以滿足最小查詢條件。
+    shipped: "0"=未出貨, "1"=已出貨, ""=不限
     """
     ps, pe = phoenix_range_days(days)
     results = []
-
     for oid in pos_list:
         oid = (oid or "").strip()
         if not oid:
             continue
-
         params = {
             "StoreKey": STORE_KEY,
             "DetailLevel": "shipping|inventory|marketplace",
@@ -261,49 +235,31 @@ def fetch_orders_by_pos(pos_list, shipped: str, days: int):
             "PageSize": str(PAGE_SIZE),
             "PageNumber": "1",
             "OriginalTxnId": oid,
-            # ★ 加入時間範圍，避免 "Minimum list of parameters" 400
             "PaymentDateStart": ps,
             "PaymentDateEnd": pe,
         }
-        # 若有指定 Shipped 就帶上（不限則不帶）
         if shipped in ("0", "1"):
             params["Shipped"] = shipped
-
         try:
             r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
         except Exception as e:
-            st.error(f"PO {oid} 連線錯誤：{e}")
-            continue
-
+            st.error(f"PO {oid} 連線錯誤：{e}"); continue
         if r.status_code != 200:
-            st.error(f"PO {oid} API 錯誤: {r.status_code}\n{r.text[:400]}")
-            continue
-
+            st.error(f"PO {oid} API 錯誤: {r.status_code}\n{r.text[:400]}"); continue
         try:
             data = r.json()
         except Exception:
-            st.error(f"PO {oid} 回傳非 JSON：{r.text[:400]}")
-            continue
-
+            st.error(f"PO {oid} 回傳非 JSON：{r.text[:400]}"); continue
         orders = data.get("orders") or data.get("Orders") or []
         for o in orders:
             od = o.get("OrderDetails") or {}
-            # 依你的規則排除 UNSP_CG（Channel Gate）
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 results.append(o)
-
-    # 若指定 shipped，再做一次本地過濾（不同租戶欄位大小寫可能不同）
     if shipped in ("0", "1"):
-        filtered = []
-        for o in results:
-            shp = str(o.get("Shipped") or o.get("shipped") or "").strip()
-            if shp == shipped:
-                filtered.append(o)
-        results = filtered
-
+        results = [o for o in results if str(o.get("Shipped") or o.get("shipped") or "").strip() == shipped]
     return results
 
-# ---------- PDF 欄位建構/填寫（保留原有產 BOL 示意） ----------
+# ---------- PDF 填寫（略同前） ----------
 def set_widget_value(widget, name, value):
     try:
         is_checkbox_type  = (widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX)
@@ -318,8 +274,7 @@ def set_widget_value(widget, name, value):
         widget.update()
         return True
     except Exception as e:
-        st.warning(f"填欄位 {name} 失敗：{e}")
-        return False
+        st.warning(f"填欄位 {name} 失敗：{e}"); return False
 
 def build_row_from_group(oid, group, wh_key: str):
     first = group[0]
@@ -409,7 +364,7 @@ def fill_pdf(row: dict, out_path: str):
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# ---------- 密碼驗證 ----------
+# 密碼驗證
 st.sidebar.subheader("🔐 驗證區")
 input_pwd = st.sidebar.text_input("請輸入密碼", type="password")
 if input_pwd != PASSWORD:
@@ -418,7 +373,7 @@ if input_pwd != PASSWORD:
 
 st.title(APP_TITLE)
 
-# 解說欄位（顯示在標題下方）
+# 說明
 st.markdown("""
 **說明：**
 1. 可能會錯, 請仔細核對
@@ -429,7 +384,7 @@ if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 左側 Sidebar：抓取天數（同時供 PO 搜尋與「抓取訂單」使用）
+# 抓取天數（同時供 PO 搜尋與一般抓單）
 days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
 # === 左側「以 PO 搜尋（每行一個）」 ===
@@ -437,7 +392,7 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("🔎 以 PO 搜尋（每行一個）")
 po_text = st.sidebar.text_area(
     "輸入 PO（OriginalTxnId）",
-    placeholder="例如：\nHD-PO-12345\nHD-PO-67890",
+    placeholder="例如：\n32585340\n46722012",
     height=120,
 )
 shipped_choice = st.sidebar.selectbox(
@@ -453,52 +408,21 @@ if st.sidebar.button("搜尋 PO", width="stretch"):
         st.warning("請輸入至少一個 PO（每行一個）。")
     else:
         shipped_val = ""
-        if shipped_choice.endswith("(0)"):
-            shipped_val = "0"
-        elif shipped_choice.endswith("(1)"):
-            shipped_val = "1"
+        if shipped_choice.endswith("(0)"): shipped_val = "0"
+        elif shipped_choice.endswith("(1)"): shipped_val = "1"
 
-        po_orders = fetch_orders_by_pos(pos_list, shipped_val, days)
-        st.session_state["po_search_results"] = po_orders
-        st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，找到 {len(po_orders)} 筆訂單（含同 PO 多項）。")
+        # 直接把 PO 搜尋結果餵給下方合併表（不顯示上方預覽）
+        orders = fetch_orders_by_pos(pos_list, shipped_val, days)
+        st.session_state["orders_raw"] = orders
+        st.session_state.pop("table_rows_override", None)
+        st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單，已依 PO 合併顯示於下方表格。")
 
-# 操作：抓單（原本功能）
+# 一般抓單
 if st.button("抓取訂單", width="stretch"):
     st.session_state["orders_raw"] = fetch_orders(days)
     st.session_state.pop("table_rows_override", None)
 
-# ======== PO 搜尋結果呈現 ========
-po_search_results = st.session_state.get("po_search_results", None)
-if po_search_results is not None:
-    st.header("🔎 PO 搜尋結果")
-    if not po_search_results:
-        st.info("沒有找到符合的訂單。")
-    else:
-        preview_rows = []
-        for o in po_search_results:
-            to = o.get("To") or {}
-            od = o.get("OrderDetails") or {}
-            ship_details = (o.get("ShippingDetails") or [{}])[0] or {}
-            pkg = ship_details.get("Package") or {}
-            tracking = pkg.get("TrackingInfo") or {}
-            preview_rows.append({
-                "PO": (o.get("OriginalTxnId") or "").strip(),
-                "Invoice": (od.get("Invoice") or "").strip(),
-                "ToName": to.get("Name", ""),
-                "City": to.get("City", ""),
-                "State": to.get("State", ""),
-                "Zip": to.get("ZipCode", ""),
-                "SCAC": (od.get("ShipClass") or "").strip(),
-                "Carrier": tracking.get("CarrierName", ""),
-                "Tracking": tracking.get("TrackingNumber", ""),
-            })
-        st.dataframe(preview_rows, width="stretch")
-        with st.expander("顯示原始 JSON（每筆訂單）", expanded=False):
-            for idx, o in enumerate(po_search_results, start=1):
-                st.write(f"--- 訂單 #{idx} ---")
-                st.json(o, expanded=False)
-
-# ======== 原本「抓取訂單」流程的呈現與產 BOL（保留） ========
+# ======== 合併表（依 OriginalTxnId 合併） + 產 BOL ========
 orders_raw = st.session_state.get("orders_raw", None)
 
 def build_table_rows_from_orders(orders_raw):
@@ -523,7 +447,6 @@ def build_table_rows_from_orders(orders_raw):
 
 if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
-
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
 
     # 批次修改倉庫
@@ -541,14 +464,13 @@ if orders_raw:
             else:
                 for r in table_rows:
                     r2 = dict(r)
-                    if r2.get("Select"):
-                        r2["Warehouse"] = bulk_wh
+                    if r2.get("Select"): r2["Warehouse"] = bulk_wh
                     new_rows.append(r2)
             st.session_state["table_rows_override"] = new_rows
             table_rows = new_rows
             st.success("已套用批次倉庫變更。")
 
-    # 表格（僅允許編輯 Warehouse 與 Select）
+    # 合併表（允許改 Warehouse / 勾選）
     edited = st.data_editor(
         st.session_state.get("table_rows_override", table_rows),
         num_rows="fixed",
@@ -565,7 +487,7 @@ if orders_raw:
         key="orders_table",
     )
 
-    # 產出 BOL（示意）
+    # 產出 BOL
     if st.button("產生 BOL（勾選列）", type="primary", width="stretch"):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
@@ -579,15 +501,12 @@ if orders_raw:
                 group = grouped.get(oid, [])
                 if not group:
                     continue
-
                 row_dict, WH = build_row_from_group(oid, group, wh_key)
-
                 sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
                 wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
                 scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
                 filename = f"BOL_{oid}_{sku8}_{wh2}_{scac}.pdf".replace(" ", "")
                 out_path = os.path.join(OUTPUT_DIR, filename)
-
                 fill_pdf(row_dict, out_path)
                 made_files.append(out_path)
 
