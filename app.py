@@ -1,9 +1,8 @@
 # app1.py — Streamlit BOL 產生器（含左側「以 PO 搜尋」）
-# 更新：
-# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限
-# - POST 到 https://api.teapplix.com/api2/OrderNotification，Operation="Submit"
-# - Header 加入 APIToken（避免 401 Missing APIToken）
-# - 所有 use_container_width 改為 width="stretch"（Streamlit 未來相容）
+# 版本要點：
+# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限，使用 GET 查詢（不走 POST Submit）
+# - Header 加入 APIToken（避免 401 Missing APIToken）；若另外需要 Authorization，可在 .env 或 secrets 設定
+# - 所有 use_container_width 改為 width="stretch"（相容 2026 之後）
 
 import os
 import io
@@ -26,7 +25,7 @@ TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
-SHIPPED   = "0"     # 0 = 未出貨（一般抓單的預設）
+SHIPPED   = "0"     # 0 = 未出貨（一般抓單預設）
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -38,24 +37,26 @@ BILL_CITYSTATEZIP = "ATLANTA, GA 30339"
 
 # ---------- secrets / env ----------
 load_dotenv(override=False)
-def _get_secret(name, default=""):
+def _sec(name, default=""):
     return st.secrets.get(name, os.getenv(name, default))
 
-TEAPPLIX_TOKEN = _get_secret("TEAPPLIX_TOKEN", "")
+TEAPPLIX_TOKEN = _sec("TEAPPLIX_TOKEN", "")
+AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")  # 若你的租戶也需要 Authorization: Bearer，可設定此值
+X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")    # 若需要 x-api-key，可設定此值
 
-# UI 倉庫代號：「CA 91789」「NJ 08816」
+# UI 倉庫代號
 WAREHOUSES = {
     "CA 91789": {
-        "name": _get_secret("W1_NAME", "Festival Neo CA"),
-        "addr": _get_secret("W1_ADDR", "5500 Mission Blvd"),
-        "citystatezip": _get_secret("W1_CITYSTATEZIP", "Montclair, CA 91763"),
-        "sid": _get_secret("W1_SID", "CA-001"),
+        "name": _sec("W1_NAME", "Festival Neo CA"),
+        "addr": _sec("W1_ADDR", "5500 Mission Blvd"),
+        "citystatezip": _sec("W1_CITYSTATEZIP", "Montclair, CA 91763"),
+        "sid": _sec("W1_SID", "CA-001"),
     },
     "NJ 08816": {
-        "name": _get_secret("W2_NAME", "Festival Neo NJ"),
-        "addr": _get_secret("W2_ADDR", "10 Main St"),
-        "citystatezip": _get_secret("W2_CITYSTATEZIP", "East Brunswick, NJ 08816"),
-        "sid": _get_secret("W2_SID", "NJ-001"),
+        "name": _sec("W2_NAME", "Festival Neo NJ"),
+        "addr": _sec("W2_ADDR", "10 Main St"),
+        "citystatezip": _sec("W2_CITYSTATEZIP", "East Brunswick, NJ 08816"),
+        "sid": _sec("W2_SID", "NJ-001"),
     },
 }
 
@@ -69,16 +70,26 @@ def phoenix_range_days(days=3):
     return start.strftime(fmt), end.strftime(fmt)
 
 def get_headers():
-    # 依實際要求，APIToken header 必填；若你的環境還需要 Authorization 或 x-api-key，可自行加上
-    return {
+    """
+    一些租戶只要 APIToken；有的同時要 Authorization Bearer / x-api-key。
+    這裡都支援，沒有就不送。
+    """
+    hdr = {
         "APIToken": TEAPPLIX_TOKEN,
         "Content-Type": "application/json;charset=UTF-8",
         "Accept": "application/json",
     }
+    if AUTH_BEARER:
+        hdr["Authorization"] = f"Bearer {AUTH_BEARER}"
+    if X_API_KEY:
+        hdr["x-api-key"] = X_API_KEY
+    return hdr
 
 def oz_to_lb(oz):
-    try: return round(float(oz)/16.0, 2)
-    except Exception: return None
+    try:
+        return round(float(oz)/16.0, 2)
+    except Exception:
+        return None
 
 def summarize_packages(order):
     details = order.get("ShippingDetails") or []
@@ -135,8 +146,10 @@ def _sku8_from_order(order):
 
 def _qty_from_order(order):
     it = _first_item(order)
-    try: return int(it.get("Quantity") or 0)
-    except Exception: return 0
+    try:
+        return int(it.get("Quantity") or 0)
+    except Exception:
+        return 0
 
 def _sum_group_totals(group):
     total_pkgs = 0
@@ -188,7 +201,7 @@ def _parse_order_date_str(first_order):
     dt_phx = dt.astimezone(tz_phx)
     return dt_phx.strftime("%m/%d/%y")  # 僅日期
 
-# ---------- API：抓取一般訂單（沿用 GET） ----------
+# ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
     page = 1
@@ -215,142 +228,23 @@ def fetch_orders(days: int):
             break
 
         orders = data.get("orders") or data.get("Orders") or []
-        if not orders: break
+        if not orders:
+            break
 
         for o in orders:
             od = o.get("OrderDetails") or {}
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 all_orders.append(o)
 
-        if len(orders) < PAGE_SIZE: break
+        if len(orders) < PAGE_SIZE:
+            break
         page += 1
     return all_orders
 
-# ---------- API：以 PO(OriginalTxnId) 透過 POST 查詢 ----------
-def _build_post_body_for_po(original_txn_id: str) -> dict:
-    """依你提供的 POST body schema，填入 Operation='Submit' 與 OriginalTxnId/StoreKey。"""
-    return {
-        "Operation": "Submit",
-        "Orders": [
-            {
-                "TxnId": "",
-                "ParentTxnId": "",
-                "OriginalTxnId": original_txn_id,
-                "StoreType": "",
-                "StoreKey": STORE_KEY,
-                "VSAccountID": "",
-                "SellerID": "",
-                "OrderSource": "",
-                "EbayBuyerID": "",
-                "PaymentStatus": "",
-                "LastUpdateDate": "",
-                "To": {
-                    "Name": "", "Company": "", "Street": "", "Street2": "", "City": "",
-                    "State": "", "ZipCode": "", "CountryCode": "", "FirstName": "",
-                    "LastName": "", "Country": "", "PhoneNumber": "", "Email": ""
-                },
-                "BillTo": {
-                    "Name": "", "Company": "", "Street": "", "Street2": "",
-                    "City": "", "State": "", "ZipCode": "", "CountryCode": ""
-                },
-                "SkipAddressValidation": False,
-                "OrderTotals": {
-                    "Shipping": 0, "Handling": 0, "Discount": 0, "Tax": 0,
-                    "InsuranceType": "", "Currency": "", "PostageCurrency": "",
-                    "Fee": 0, "Total": 0
-                },
-                "OrderDetails": {
-                    "Invoice": "", "PaymentDate": "", "Memo": "", "PrivateMemo": "",
-                    "GiftMessage": "", "WarehouseId": 0, "WarehouseName": "",
-                    "QueueId": 0, "TagList": [""], "ShipClass": "", "Custom": "",
-                    "Custom2": "", "Custom3": "", "Custom4": ""
-                },
-                "OrderItems": [
-                    {
-                        "Name": "", "LineNumber": 0, "ItemId": "", "ItemSKU": "",
-                        "ItemLocation": "", "Description": "", "Quantity": 0,
-                        "Amount": 0, "Shipping": 0, "Tax": 0, "ItemCustom": "",
-                        "Shipping Tax": 0
-                    }
-                ],
-                "ShippingDetails": [
-                    {
-                        "Package": {
-                            "Method": "",
-                            "Weight": {"Value": 0, "Unit": ""},
-                            "Dimensions": {"Length": 0, "Width": 0, "Depth": 0, "Unit": ""},
-                            "IdenticalPackageCount": 0, "Type": "",
-                            "PackageItems": [{"LineNumber": 0, "Name": "", "Quantity": 0}],
-                            "Reference": "", "InsuranceValue": 0, "InsuranceFee": 0,
-                            "Postage": 0,
-                            "TrackingInfo": {"TrackingNumber": "", "CarrierName": "", "SSCC": ""}
-                        },
-                        "ShipDate": "", "PostageAccount": ""
-                    }
-                ],
-                "DropshipDetails": {"ProductPrice": 0, "Markup": 0, "Handling": 0, "Packing": 0},
-                "Options": {
-                    "InsuranceType": "", "InsuranceClosed": False, "InsuranceClosedReason": "",
-                    "Billed": {"Role": "", "AccountNumber": "", "AccountPostalCode": "", "AccountCountryCode": ""},
-                    "DutyBilled": {"Role": "", "AccountNumber": "", "AccountPostalCode": "", "AccountCountryCode": ""},
-                    "SplitDutyVAT": False,
-                    "Delivery": {"Signature": "", "Saturday": 0, "Sunday": False, "Holiday": False, "Weekend": False,
-                                 "Am": False, "Restricted": False, "Inside": False, "Residential": 0,
-                                 "HomeDeliveryDate": "", "Instructions": "", "LiftGate": False, "LimitedAccess": False,
-                                 "ConstructionSite": False, "CallBefore": False},
-                    "Service": {"RegisteredMail": False, "AdditionalHandling": False, "ShipperRelease": False,
-                                "CarbonNeutral": False, "DangerousGoods": False, "HandlingCharge": False,
-                                "ExtremeLength": False, "ReturnsClearance": False, "Pickup": False},
-                    "Cod": {"Amount": {"Amount": 0, "Currency": ""}, "Kind": "", "CollectionType": "",
-                            "Address": {"Name": "", "Company": "", "Street": "", "Street2": "", "City": "", "State": "",
-                                        "ZipCode": "", "CountryCode": "", "FirstName": "", "LastName": "", "Country": "",
-                                        "PhoneNumber": "", "Email": ""}, "ReferenceIndicator": "",
-                            "TransportationChargesDetail": "", "RecipientAccountNumber": "", "BillingOption": ""},
-                    "Ups": {"SurepostNonMachineable": False,
-                            "Qvn": {"Qvn": 0, "From": "", "EmailOnFail": "", "Subject": "", "Memo": "",
-                                    "Recipients": [{"CompanyOrName": "", "ContactName": "", "Email": "",
-                                                    "ShipNotify": False, "ExceptionNotify": False,
-                                                    "DeliveryNotify": False, "BolNotify": False,
-                                                    "BolEmailSubject": "", "BolEmailText": ""}]} ,
-                            "Freight": {"Class": 0, "PackageType": "", "PackagesQuantity": 0, "PayerName": "",
-                                        "PayerAddress": "", "PayerCity": "", "PayerState": "",
-                                        "SortingAndSegregating": False, "SortingQuantity": "", "ExtremeLength": False,
-                                        "FreezableProtection": False, "Handling": {"Charge": "", "ChargeType": "",
-                                                                                   "ChargeValue": "", "Instructions": ""},
-                                        "DangerousGoods": {"Type": 0, "Name": "", "PhoneNumber": "", "PhoneExtension": ""},
-                                        "Pickup": {"Weekend": False, "Holiday": False, "Inside": False,
-                                                   "Residential": False, "LimitedAccess": False, "LiftGate": False,
-                                                   "Instructions": ""}}},
-                    "Fedex": {"CustomsOption": "", "Coverage": "",
-                              "ExportDetail": {"Kind": "", "ForeignZoneCode": "", "EntryNumber": "", "LicenseNumber": "",
-                                               "ExpirationDate": ""},
-                              "Recipient": {"TaxId": {"Type": "", "Number": ""}, "CustomsId": {"Type": "", "Number": ""}},
-                              "HoldAtLocation": {"Applied": "", "Address": "", "AddressType": ""},
-                              "SmartPostEndiciaType": "", "TotalPalletWeight": 0, "FreightGuaranteeDetailDate": "",
-                              "Delivery": {"Signature": "", "Saturday": 0, "Sunday": False, "Holiday": False,
-                                           "Weekend": False, "Am": False, "Restricted": False, "Inside": False,
-                                           "Residential": 0, "HomeDeliveryDate": "", "Instructions": "",
-                                           "LiftGate": False, "LimitedAccess": False, "ConstructionSite": False,
-                                           "CallBefore": False},
-                              "Instructions": {"Handling": "", "Delivery": "", "HomeDelivery": "", "Pickup": ""},
-                              "Freight": {"Class": "", "PackageType": "", "PrintedReferenceType": "",
-                                          "PrintedReferenceValue": "", "GuaranteeDetailType": "",
-                                          "GuaranteeDetailDate": "", "Note": ""},
-                              "BillAccount": "", "CollectTermsType": "", "BrokerType": "", "SignatureReleaseNumber": "",
-                              "HandlingUnits": "", "ExpressFreightBookingConfirmationNumber": "", "B13aFilling": "",
-                              "ExportStatement": "", "ImportOfRecordAccountNumber": ""},
-                    "DHL": {"TermsOfTrade": "", "ConsigneeTaxIdType": "", "ConsigneeTaxId": "", "ConsigneeIdType": "", "ConsigneeId": ""},
-                    "DHLE": {"DeliveryType": ""}
-                },
-                "CustomsOptions": {"ReasonForExport": "", "IOSSNumber": "", "BrokerAddress": ""},
-                "HandlingBy": "", "DeliverBy": "", "SeqNumber": "", "RMACode": ""
-            }
-        ]
-    }
-
-def fetch_orders_by_pos_post(pos_list, shipped: str):
+# ---------- API：以 PO(OriginalTxnId) 透過 GET 查詢（關鍵：不走 POST Submit） ----------
+def fetch_orders_by_pos(pos_list, shipped: str):
     """
-    用 POST + 你提供的 body schema，逐一以 OriginalTxnId 查單。
+    以 OriginalTxnId(=PO) 清單查單；每個 PO 發一個 GET。
     shipped: "0"=未出貨, "1"=已出貨, ""=不限
     回傳: list[order dict]
     """
@@ -360,21 +254,19 @@ def fetch_orders_by_pos_post(pos_list, shipped: str):
         if not oid:
             continue
 
-        body = _build_post_body_for_po(oid)
-
-        # 以 URL params 補充查詢條件（與 GET 對齊）
         params = {
             "StoreKey": STORE_KEY,
             "DetailLevel": "shipping|inventory|marketplace",
             "Combine": "combine",
             "PageSize": str(PAGE_SIZE),
             "PageNumber": "1",
+            "OriginalTxnId": oid,   # 直接以 querystring 查 PO
         }
         if shipped in ("0", "1"):
             params["Shipped"] = shipped
 
         try:
-            r = requests.post(BASE_URL, headers=get_headers(), params=params, json=body, timeout=45)
+            r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
         except Exception as e:
             st.error(f"PO {oid} 連線錯誤：{e}")
             continue
@@ -392,10 +284,11 @@ def fetch_orders_by_pos_post(pos_list, shipped: str):
         orders = data.get("orders") or data.get("Orders") or []
         for o in orders:
             od = o.get("OrderDetails") or {}
+            # 依你的規則排除 UNSP_CG（Channel Gate）
             if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
                 results.append(o)
 
-    # 若指定 shipped，再保險做一次本地過濾（有些帳戶回傳欄位大小寫不同）
+    # 若指定 shipped，再做一次本地過濾（不同租戶欄位大小寫可能不同）
     if shipped in ("0", "1"):
         filtered = []
         for o in results:
@@ -503,8 +396,10 @@ def fill_pdf(row: dict, out_path: str):
             name = w.field_name
             if name and name in row:
                 set_widget_value(w, name, row[name])
-    try: doc.need_appearances = True
-    except Exception: pass
+    try:
+        doc.need_appearances = True
+    except Exception:
+        pass
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     doc.save(out_path, deflate=True, incremental=False, encryption=fitz.PDF_ENCRYPT_KEEP)
     doc.close()
@@ -513,7 +408,7 @@ def fill_pdf(row: dict, out_path: str):
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 # ---------- 密碼驗證 ----------
-PASSWORD = st.secrets.get("APP_PASSWORD", os.getenv("APP_PASSWORD", "")) # 可改預設密碼
+PASSWORD = _sec("APP_PASSWORD", "")
 st.sidebar.subheader("🔐 驗證區")
 input_pwd = st.sidebar.text_input("請輸入密碼", type="password")
 
@@ -538,7 +433,7 @@ if not TEAPPLIX_TOKEN:
 # 左側 Sidebar：天數下拉
 days = st.sidebar.selectbox("抓取天數", options=[1,2,3,4,5,6,7], index=2, help="預設 3 天（index=2）")
 
-# === 新增：左側「以 PO 搜尋（每行一個）」 ===
+# === 左側「以 PO 搜尋（每行一個）」 ===
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔎 以 PO 搜尋（每行一個）")
 po_text = st.sidebar.text_area(
@@ -564,14 +459,13 @@ if st.sidebar.button("搜尋 PO", width="stretch"):
         elif shipped_choice.endswith("(1)"):
             shipped_val = "1"
 
-        po_orders = fetch_orders_by_pos_post(pos_list, shipped_val)
+        po_orders = fetch_orders_by_pos(pos_list, shipped_val)
         st.session_state["po_search_results"] = po_orders
         st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，找到 {len(po_orders)} 筆訂單（含同 PO 多項）。")
 
 # 操作：抓單（原本功能）
 if st.button("抓取訂單", width="stretch"):
     st.session_state["orders_raw"] = fetch_orders(days)
-    # 清掉之前的覆蓋資料
     st.session_state.pop("table_rows_override", None)
 
 # ======== PO 搜尋結果呈現 ========
@@ -608,29 +502,28 @@ if po_search_results is not None:
 # ======== 原本「抓取訂單」流程的呈現與產 BOL（保留） ========
 orders_raw = st.session_state.get("orders_raw", None)
 
-if orders_raw:
+def build_table_rows_from_orders(orders_raw):
     grouped = group_by_original_txn(orders_raw)
+    table_rows = []
+    for oid, group in grouped.items():
+        first = group[0]
+        od = first.get("OrderDetails") or {}
+        scac = (od.get("ShipClass") or "").strip()
+        sku8 = _sku8_from_order(first)
+        order_date_str = _parse_order_date_str(first)
+        table_rows.append({
+            "Select": True,
+            "Warehouse": "CA 91789",
+            "OriginalTxnId": oid,
+            "SKU8": sku8,
+            "SCAC": scac,
+            "ToState": (first.get("To") or {}).get("State",""),
+            "OrderDate": order_date_str,
+        })
+    return grouped, table_rows
 
-    # 準備表格資料
-    if "table_rows_override" in st.session_state:
-        table_rows = st.session_state["table_rows_override"]
-    else:
-        table_rows = []
-        for oid, group in grouped.items():
-            first = group[0]
-            od = first.get("OrderDetails") or {}
-            scac = (od.get("ShipClass") or "").strip()
-            sku8 = _sku8_from_order(first)
-            order_date_str = _parse_order_date_str(first)  # 只日期
-            table_rows.append({
-                "Select": True,
-                "Warehouse": "CA 91789",  # 預設
-                "OriginalTxnId": oid,
-                "SKU8": sku8,
-                "SCAC": scac,
-                "ToState": (first.get("To") or {}).get("State",""),
-                "OrderDate": order_date_str,
-            })
+if orders_raw:
+    grouped, table_rows = build_table_rows_from_orders(orders_raw)
 
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
 
@@ -658,7 +551,7 @@ if orders_raw:
 
     # 表格（僅允許編輯 Warehouse 與 Select）
     edited = st.data_editor(
-        table_rows,
+        st.session_state.get("table_rows_override", table_rows),
         num_rows="fixed",
         hide_index=True,
         column_config={
