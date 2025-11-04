@@ -1,9 +1,9 @@
-# app1.py — Streamlit BOL 產生器（原功能）+ 左側「以 PO 搜尋（POST）」功能
-# 說明：
-# - 以 OriginalTxnId(=PO) 搜尋，支援多行輸入；可選 Shipped=0/1；查到的結果會在頁面上顯示表格與原始 JSON
-# - 查詢使用 POST https://api.teapplix.com/api2/OrderNotification
-# - POST body 採用你提供的 Orders schema（最小欄位：OriginalTxnId, StoreKey），其他欄位留空
-# - 會同時帶上 params: Combine, DetailLevel，以及必要時的 Shipped
+# app1.py — Streamlit BOL 產生器（含左側「以 PO 搜尋」）
+# 更新：
+# - 左側以 OriginalTxnId(=PO) 搜尋（每行一個），Shipped 可選 0/1/不限
+# - POST 到 https://api.teapplix.com/api2/OrderNotification，Operation="Submit"
+# - Header 加入 APIToken（避免 401 Missing APIToken）
+# - 所有 use_container_width 改為 width="stretch"（Streamlit 未來相容）
 
 import os
 import io
@@ -26,7 +26,7 @@ TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
-SHIPPED   = "0"     # 0 = 未出貨
+SHIPPED   = "0"     # 0 = 未出貨（一般抓單的預設）
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -64,12 +64,12 @@ def phoenix_range_days(days=3):
     tz = ZoneInfo("America/Phoenix")
     now = datetime.now(tz)
     start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
-    end   = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    fmt = "%Y/%m/%d"
+    end   = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    fmt = "%Y-%m-%dT%H:%M:%S"
     return start.strftime(fmt), end.strftime(fmt)
 
 def get_headers():
-    # 依你先前環境的要求：APIToken header 為必填；若有額外 auth，可自行加上
+    # 依實際要求，APIToken header 必填；若你的環境還需要 Authorization 或 x-api-key，可自行加上
     return {
         "APIToken": TEAPPLIX_TOKEN,
         "Content-Type": "application/json;charset=UTF-8",
@@ -188,7 +188,7 @@ def _parse_order_date_str(first_order):
     dt_phx = dt.astimezone(tz_phx)
     return dt_phx.strftime("%m/%d/%y")  # 僅日期
 
-# ---------- API：抓取一般訂單（沿用原本 GET 方案） ----------
+# ---------- API：抓取一般訂單（沿用 GET） ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
     page = 1
@@ -228,9 +228,9 @@ def fetch_orders(days: int):
 
 # ---------- API：以 PO(OriginalTxnId) 透過 POST 查詢 ----------
 def _build_post_body_for_po(original_txn_id: str) -> dict:
-    """依你提供的 POST body schema，最小必要欄位填入 OriginalTxnId 與 StoreKey。"""
+    """依你提供的 POST body schema，填入 Operation='Submit' 與 OriginalTxnId/StoreKey。"""
     return {
-        "Operation": "",
+        "Operation": "Submit",
         "Orders": [
             {
                 "TxnId": "",
@@ -552,7 +552,7 @@ shipped_choice = st.sidebar.selectbox(
     index=0,
     help="0 = 未出貨，1 = 已出貨",
 )
-if st.sidebar.button("搜尋 PO", use_container_width=True):
+if st.sidebar.button("搜尋 PO", width="stretch"):
     raw_lines = (po_text or "").splitlines()
     pos_list = [ln.strip() for ln in raw_lines if ln.strip()]
     if not pos_list:
@@ -569,7 +569,7 @@ if st.sidebar.button("搜尋 PO", use_container_width=True):
         st.success(f"搜尋完成：輸入 {len(pos_list)} 筆 PO，找到 {len(po_orders)} 筆訂單（含同 PO 多項）。")
 
 # 操作：抓單（原本功能）
-if st.button("抓取訂單", use_container_width=True):
+if st.button("抓取訂單", width="stretch"):
     st.session_state["orders_raw"] = fetch_orders(days)
     # 清掉之前的覆蓋資料
     st.session_state.pop("table_rows_override", None)
@@ -599,7 +599,7 @@ if po_search_results is not None:
                 "Carrier": tracking.get("CarrierName", ""),
                 "Tracking": tracking.get("TrackingNumber", ""),
             })
-        st.dataframe(preview_rows, use_container_width=True)
+        st.dataframe(preview_rows, width="stretch")
         with st.expander("顯示原始 JSON（每筆訂單）", expanded=False):
             for idx, o in enumerate(po_search_results, start=1):
                 st.write(f"--- 訂單 #{idx} ---")
@@ -641,7 +641,7 @@ if orders_raw:
     with bulk_col2:
         apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
     with bulk_col3:
-        if st.button("套用批次倉庫", use_container_width=True):
+        if st.button("套用批次倉庫"):
             new_rows = []
             if apply_to == "全部":
                 for r in table_rows:
@@ -660,7 +660,6 @@ if orders_raw:
     edited = st.data_editor(
         table_rows,
         num_rows="fixed",
-        use_container_width=True,
         hide_index=True,
         column_config={
             "Select": st.column_config.CheckboxColumn("選取", default=True),
@@ -675,7 +674,7 @@ if orders_raw:
     )
 
     # 產出 BOL（示意）
-    if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
+    if st.button("產生 BOL（勾選列）", type="primary", width="stretch"):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
@@ -712,7 +711,7 @@ if orders_raw:
                     data=mem_zip,
                     file_name=f"BOL_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                     mime="application/zip",
-                    use_container_width=True,
+                    width="stretch",
                 )
             else:
                 st.warning("沒有產生任何檔案。")
