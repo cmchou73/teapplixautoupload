@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
+import re
 from importorder import build_soap_envelope, requests_session_with_retry, call_soap, send_create_order
 
 try:
@@ -462,26 +463,26 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
 
 def _extract_wms_json(resp_text: str) -> dict:
     """
-    Try to extract the JSON segment from the SOAP response, then parse and return as dict.
-    Returns {} if not found or parse error.
+    Try to extract JSON segment from SOAP response text.
+    Looks for the first {...} block and parses it.
     """
     if not isinstance(resp_text, str) or not resp_text:
         return {}
-    # common pattern: <response>{...}</response> or direct JSON within the text
-    # find first JSON object with "ask":
-    m = re.search(r'\{(?:[^{}]|(?R))*\}', resp_text)
-    if not m:
-        # fallback: between <response>...</response>
-        m2 = re.search(r'<response>(\{.*?\})</response>', resp_text, flags=re.DOTALL)
-        if not m2:
-            return {}
-        json_str = m2.group(1)
-    else:
-        json_str = m.group(0)
+
+    # 找出第一個 "{" 開始到最後一個 "}" 結束的 JSON 片段
+    start = resp_text.find("{")
+    end = resp_text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+
+    json_str = resp_text[start:end + 1]
+
+    # 嘗試解析
+    import json
     try:
         return json.loads(json_str)
     except Exception:
-        # try to unescape XML entities
+        # 有時 SOAP 裡會帶轉義符號
         j2 = json_str.replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
         try:
             return json.loads(j2)
