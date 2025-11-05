@@ -532,6 +532,7 @@ st.title(APP_TITLE)
 st.markdown("""
 **說明：**
 1. 可能會錯, 請仔細核對
+2. "不會" 回傳到Commercehub
 2. ABCD
 """)
 
