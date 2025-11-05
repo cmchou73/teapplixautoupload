@@ -8,9 +8,6 @@ from urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 
 # ====== 必填：改成你的實際 API 入口與憑證 ======
-#ENDPOINT_URL = "http://ecs.yunwms.com/default/svc/web-service"  # ← 替換為實際 SOAP 端點
-#APP_TOKEN = "27c1069aba561f1f34ef9d59abc44f7d"  # ← 你的 appToken
-#APP_KEY = "fc5b0b451744cd1fac6e5d0c1722cf71"      # ← 你的 appKey
 SERVICE = "createOrder" # ← 服務名
 # ===========================================
 
