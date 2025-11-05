@@ -550,7 +550,7 @@ if st.sidebar.button("抓取訂單", use_container_width=True):
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔎 PO 搜尋（最近 14 天）")
 po_text = st.sidebar.text_area("輸入 PO（每行一個）", placeholder="例如：\n32585340\n46722012", height=120)
-shipped_choice = st.sidebar.selectbox("出貨狀態（Shipped）", options=["不限", "未出貨(0)", "已出貨(1)"], index=0)
+shipped_choice = st.sidebar.selectbox("出貨狀態（Shipped）", options=["不限", "未出貨", "已出貨"], index=0)
 if st.sidebar.button("搜尋 PO（14 天內）", use_container_width=True):
     raw_lines = (po_text or "").splitlines()
     pos_list = [ln.strip() for ln in raw_lines if ln.strip()]
@@ -588,7 +588,7 @@ def build_table_rows_from_orders(orders_raw):
 
 if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
-    st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
+    st.caption(f"共 {len(table_rows)} 筆")
 
     ## 批次修改倉庫
     #bc1, bc2, bc3 = st.columns([1,1,6])
@@ -678,7 +678,7 @@ if orders_raw:
                 st.warning("沒有產生任何檔案。")
 
     # ======== 新流程：推送到 WMS（先人工修改） ========
-    if st.button("推送到 WMS（先人工修改）", type="primary", use_container_width=True):
+    if st.button("推送到 海外倉（先人工修改）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
@@ -778,13 +778,13 @@ if orders_raw:
                                 st.json(parsed2)
                                 # 成功條件：ask=Success 或 error_code=0
                                 if (str(parsed2.get("ask", "")).lower() == "success") or (str(parsed2.get("error_code", "")) == "0"):
-                                    st.success("✅ WMS 上傳成功！")
+                                    st.success("✅ 海外倉 上傳成功！")
                                 else:
-                                    st.warning("⚠️ WMS 回傳非成功狀態，請檢查上方 JSON/回應內容。")
+                                    st.warning("⚠️ 海外倉 回傳非成功狀態，請檢查上方 JSON/回應內容。")
                             else:
                                 # 沒抓到 JSON，但若關鍵字含 Success 也當成功提示
                                 if ("\"ask\":\"Success\"" in text2) or ("\"message\":\"Success\"" in text2):
-                                    st.success("✅ WMS 上傳成功！")
+                                    st.success("✅ 海外倉 上傳成功！")
                                 else:
                                     st.info(f"HTTP {resp2.status_code}，請檢查回應內容。")
                         except Exception as e:
