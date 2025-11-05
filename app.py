@@ -14,11 +14,21 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
-import fitz  # PyMuPDF
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    st.error("PyMuPDF 未安裝，請在環境中安裝：pip install pymupdf")
+    raise
 
-APP_TITLE = "Teapplix HD LTL BOL 產生器"
-TEMPLATE_PDF = "BOL.pdf"
+import json
+import base64
+from urllib.parse import urlencode
+from dotenv import load_dotenv
+
+load_dotenv(override=False)
+
+APP_TITLE = "BOL 工具 & WMS 推單（測試）"
+TEMPLATE_PDF = "bol_template.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
 STORE_KEY = "HD"
@@ -33,7 +43,6 @@ BILL_ADDRESS      = "2455 PACES FERRY RD"
 BILL_CITYSTATEZIP = "ATLANTA, GA 30339"
 
 # ---------- secrets / env ----------
-load_dotenv(override=False)
 def _sec(name, default=""):
     return st.secrets.get(name, os.getenv(name, default))
 
@@ -49,20 +58,8 @@ WAREHOUSES = {
         "addr": _sec("W1_ADDR", "5500 Mission Blvd"),
         "citystatezip": _sec("W1_CITYSTATEZIP", "Montclair, CA 91763"),
         "sid": _sec("W1_SID", "CA-001"),
-    },
-    "NJ 08816": {
-        "name": _sec("W2_NAME", "Festival Neo NJ"),
-        "addr": _sec("W2_ADDR", "10 Main St"),
-        "citystatezip": _sec("W2_CITYSTATEZIP", "East Brunswick, NJ 08816"),
-        "sid": _sec("W2_SID", "NJ-001"),
-    },
-}
-
-
-# ---------- WMS API configs (by warehouse) ----------
-WMS_CONFIGS = {
-    "CA 91789": {
-        # placeholders; fill with real values in secrets/.env if/when needed
+        "tel": _sec("W1_TEL", "909-000-0000"),
+        "SCAC": _sec("W1_SCAC", "FEDXG"),
         "ENDPOINT_URL": _sec("W1_WMS_ENDPOINT", ""),
         "APP_TOKEN": _sec("W1_WMS_APP_TOKEN", ""),
         "APP_KEY": _sec("W1_WMS_APP_KEY", ""),
@@ -86,6 +83,11 @@ def phoenix_range_days(days=3):
     fmt = "%Y-%m-%dT%H:%M:%S"
     return start.strftime(fmt), end.strftime(fmt)
 
+def default_pickup_date_str():
+    """回傳 Phoenix 時區兩天後的日期（YYYY-MM-DD）。"""
+    tz = ZoneInfo("America/Phoenix")
+    return (datetime.now(tz) + timedelta(days=2)).date().isoformat()
+
 def get_headers():
     hdr = {
         "APIToken": TEAPPLIX_TOKEN,
@@ -95,72 +97,58 @@ def get_headers():
     if AUTH_BEARER:
         hdr["Authorization"] = f"Bearer {AUTH_BEARER}"
     if X_API_KEY:
-        hdr["x-api-key"] = X_API_KEY
+        hdr["X-API-KEY"] = X_API_KEY
     return hdr
 
-def oz_to_lb(oz):
-    try: return round(float(oz)/16.0, 2)
-    except Exception: return None
+def call_api(path, payload: dict):
+    url = f"{BASE_URL}/{path}"
+    hdr = get_headers()
+    try:
+        r = requests.post(url, json=payload, headers=hdr, timeout=60)
+        return r
+    except Exception as e:
+        st.error(f"API 連線錯誤：{e}")
+        raise
 
-def summarize_packages(order):
-    details = order.get("ShippingDetails") or []
-    total_pkgs = 0
-    total_lb = 0.0
-    for sd in details:
-        pkg = sd.get("Package") or {}
-        count = int(pkg.get("IdenticalPackageCount") or 1)
-        wt = pkg.get("Weight") or {}
-        lb = oz_to_lb(wt.get("Value")) or 0.0
-        total_pkgs += max(1, count)
-        total_lb   += lb * max(1, count)
-    return total_pkgs, int(round(total_lb))
+def _safe(v, default=""):
+    return (v if v is not None else default)
 
-def override_carrier_name_by_scac(scac: str, current_name: str) -> str:
-    s = (scac or "").strip().upper()
-    mapping = {
-        "EXLA": "Estes Express Lines",
-        "AACT": "AAA Cooper Transportation",
-        "CTII": "Central Transport Inc.",
-        "CETR": "Central Transport Inc.",
-        "ABF":  "ABF",
-        "PITD": "PITT Ohio",
-        "FXFE": "FedEx Freight",
-        "UPGF": "UPS Freight",
-        "RLCA": "R+L Carriers",
-        "SAIA": "SAIA",
-        "ODFL": "Old Dominion",
-    }
-    return mapping.get(s, current_name)
+def _first_nonempty(*vals):
+    for v in vals:
+        if v:
+            return v
+    return ""
 
-def group_by_original_txn(orders):
-    grouped = {}
-    for order in orders:
-        oid = (order.get("OriginalTxnId") or "").strip()
-        grouped.setdefault(oid, []).append(order)
-    return grouped
+def _safe_get_nested(dct, *keys, default=""):
+    cur = dct or {}
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur in (None, ""):
+            return default
+    return cur
 
-def _first_item(order):
-    items = order.get("OrderItems") or []
-    if isinstance(items, list) and items:
-        return items[0]
-    if isinstance(items, dict):
-        return items
-    return {}
+def _qty_from_order(o):
+    od = o.get("OrderDetails") or {}
+    try:
+        q = int(od.get("Quantity") or 0)
+    except Exception:
+        q = 0
+    return q
 
-def _desc_value_from_order(order):
-    sku = (_first_item(order).get("ItemSKU") or "")
-    return f"{sku}  (Electric Fireplace)".strip()
+def summarize_packages(o):
+    od = o.get("OrderDetails") or {}
+    pkgs = _first_nonempty(od.get("Packages"), od.get("NoOfPackages"), od.get("PackagesQty"), od.get("Quantity"), 1)
+    weight = _first_nonempty(od.get("WeightLBS"), od.get("Weight"), od.get("totalWeight"), od.get("WeightLbs"), 0)
+    return pkgs, weight
 
-def _sku8_from_order(order):
-    sku = (_first_item(order).get("ItemSKU") or "")
-    return sku[:8] if sku else ""
+def _sku8_from_order(o):
+    od = o.get("OrderDetails") or {}
+    sku = _first_nonempty(od.get("SKU"), od.get("Sku"), od.get("ItemName2"), od.get("ItemName"), od.get("BuyerNotes"))
+    return (sku or "")[:8] if sku else ""
 
-def _qty_from_order(order):
-    it = _first_item(order)
-    try: return int(it.get("Quantity") or 0)
-    except Exception: return 0
-
-def _sum_group_totals(group):
+def summarize_packages_group(group: list):
     total_pkgs = 0
     total_lb = 0.0
     for od in group:
@@ -191,76 +179,60 @@ def _parse_order_date_str(first_order):
             for fmt in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"):
                 try:
                     dt = datetime.strptime(val, fmt); break
-                except Exception: continue
+                except Exception:
+                    pass
     except Exception:
-        dt = None
-    if dt is None:
-        try: dt = datetime.fromisoformat(val[:19])
-        except Exception: return ""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=tz_phx)
-    dt_phx = dt.astimezone(tz_phx)
-    return dt_phx.strftime("%m/%d/%y")
+        pass
+    if not dt: return ""
+    dt = dt.astimezone(ZoneInfo("America/Phoenix"))
+    return dt.strftime("%m/%d/%y")
 
-# ---------- API：抓取一般訂單（GET） ----------
-def fetch_orders(days: int):
-    ps, pe = phoenix_range_days(days)
-    page = 1
-    all_orders = []
-    while True:
-        params = {
-            "PaymentDateStart": ps,
-            "PaymentDateEnd": pe,
-            "Shipped": SHIPPED_DEFAULT,
-            "StoreKey": STORE_KEY,
-            "PageSize": str(PAGE_SIZE),
-            "PageNumber": str(page),
-            "Combine": "combine",
-            "DetailLevel": "shipping|inventory|marketplace",
-        }
-        r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
-        if r.status_code != 200:
-            st.error(f"API 錯誤: {r.status_code}\n{r.text}"); break
-        try:
-            data = r.json()
-        except Exception:
-            st.error(f"JSON 解析錯誤：{r.text[:1000]}"); break
-        orders = data.get("orders") or data.get("Orders") or []
-        if not orders: break
-        for o in orders:
-            od = o.get("OrderDetails") or {}
-            if (od.get("ShipClass") or "").strip().upper() != "UNSP_CG":
-                all_orders.append(o)
-        if len(orders) < PAGE_SIZE: break
-        page += 1
-    return all_orders
+def fetch_orders(days=3, shipped=SHIPPED_DEFAULT):
+    start_iso, end_iso = phoenix_range_days(days)
+    payload = {
+        "StoreKey": STORE_KEY,
+        "StartTime": start_iso,
+        "EndTime": end_iso,
+        "PageSize": PAGE_SIZE,
+        "PageNo": 1,
+        "Shipped": shipped
+    }
+    try:
+        r = call_api("GetOrdersByUpdateTime", payload)
+    except Exception as e:
+        st.error(f"抓單失敗：{e}")
+        return []
+    if r.status_code != 200:
+        st.error(f"抓單 API 錯誤: {r.status_code}\n{r.text[:400]}")
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        st.error(f"抓單回傳非 JSON：{r.text[:400]}")
+        return []
+    return data.get("orders") or data.get("Orders") or []
 
-# ---------- API：以 PO(OriginalTxnId) 查詢（固定最近 14 天 + 嚴格等於過濾） ----------
-def fetch_orders_by_pos(pos_list, shipped: str):
+def fetch_orders_by_pos(polist: list, shipped=""):
     """
-    每個 PO 發一個 GET；固定附帶最近 14 天的 PaymentDate 範圍。
-    伺服器回傳後，於本機強制 OriginalTxnId 嚴格等於過濾。
+    以 PO（OriginalTxnId）嚴格等於查詢；只看最近 14 天
     """
-    ps, pe = phoenix_range_days(14)  # ★ 固定 14 天
     results = []
-    for oid in pos_list:
-        oid = (oid or "").strip()
-        if not oid:
-            continue
-        params = {
+    shipped = str(shipped or "").strip()
+    start_iso, end_iso = phoenix_range_days(14)
+    headers = get_headers()
+    for oid in polist:
+        payload = {
             "StoreKey": STORE_KEY,
-            "DetailLevel": "shipping|inventory|marketplace",
-            "Combine": "combine",
-            "PageSize": str(PAGE_SIZE),
-            "PageNumber": "1",
-            "OriginalTxnId": oid,
-            "PaymentDateStart": ps,
-            "PaymentDateEnd": pe,
+            "OriginalTxns": [oid],
+            "StartTime": start_iso,
+            "EndTime": end_iso,
+            "PageSize": PAGE_SIZE,
+            "PageNo": 1,
         }
         if shipped in ("0", "1"):
-            params["Shipped"] = shipped
+            payload["Shipped"] = shipped
         try:
-            r = requests.get(BASE_URL, headers=get_headers(), params=params, timeout=45)
+            r = requests.post(f"{BASE_URL}/GetOrdersByOriginalTxnId", json=payload, headers=headers, timeout=60)
         except Exception as e:
             st.error(f"PO {oid} 連線錯誤：{e}"); continue
         if r.status_code != 200:
@@ -291,62 +263,51 @@ def set_widget_value(widget, name, value):
     try:
         is_checkbox_type  = (widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX)
         is_checkbox_named = (name in CHECKBOX_FIELDS)
-        is_forced_text    = (name in FORCE_TEXT_FIELDS)
-        is_checkbox       = (is_checkbox_type or is_checkbox_named) and not is_forced_text
-        if is_checkbox:
-            v = str(value).strip().lower()
-            widget.field_value = "Yes" if v in {"on","yes","1","true","x","✔"} else "Off"
+        if is_checkbox_type and is_checkbox_named:
+            widget.field_value = "Yes" if str(value).strip().upper() in ("YES", "1", "TRUE", "ON", "CHECKED") else "Off"
         else:
-            widget.field_value = "" if value is None else str(value)
-        widget.update()
-        return True
-    except Exception as e:
-        st.warning(f"填欄位 {name} 失敗：{e}"); return False
+            widget.field_value = str(value)
+    except Exception:
+        try:
+            widget.field_value = str(value)
+        except Exception:
+            pass
 
-def build_row_from_group(oid, group, wh_key: str):
-    first = group[0]
+def build_row_from_group(oid: str, group: list, wh_key: str):
+    total_pkgs, total_lb = summarize_packages_group(group)
+    WH = WAREHOUSES.get(wh_key, {})
+    first = group[0] if group else {}
     to = first.get("To") or {}
-    od = first.get("OrderDetails") or {}
-
-    ship_details = (first.get("ShippingDetails") or [{}])[0] or {}
-    pkg = ship_details.get("Package") or {}
-    tracking = pkg.get("TrackingInfo") or {}
-
-    scac_from_shipclass = (od.get("ShipClass") or "").strip()
-    carrier_name_raw = (tracking.get("CarrierName") or "").strip()
-    carrier_name_final = override_carrier_name_by_scac(scac_from_shipclass, carrier_name_raw)
-
-    street  = (to.get("Street") or "")
-    street2 = (to.get("Street2") or "")
-    to_address = (street + (" " + street2 if street2 else "")).strip()
-    custom_code = (od.get("Custom") or "").strip()
-
-    total_pkgs, total_lb = _sum_group_totals(group)
-    bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
-
-    WH = WAREHOUSES.get(wh_key, list(WAREHOUSES.values())[0])
+    shipto_name = _first_nonempty(to.get("FullName"), to.get("Name"), to.get("BuyerName"), to.get("Receiver"))
+    shipto_street = _first_nonempty(to.get("Address1"), to.get("Street"), to.get("Addr1"))
+    shipto_city = _first_nonempty(to.get("City"), to.get("Town"))
+    shipto_state = _first_nonempty(to.get("State"), to.get("Province"))
+    shipto_zip = _first_nonempty(to.get("Zip"), to.get("ZipCode"))
 
     row = {
-        "BillName": BILL_NAME,
-        "BillAddress": BILL_ADDRESS,
-        "BillCityStateZip": BILL_CITYSTATEZIP,
-        "ToName": to.get("Name", ""),
-        "ToAddress": to_address,
-        "ToCityStateZip": f"{to.get('City','')}, {to.get('State','')} {to.get('ZipCode','')}".strip().strip(", "),
-        "ToCID": to.get("PhoneNumber", ""),
-        "FromName": WH["name"],
-        "FromAddr": WH["addr"],
-        "FromCityStateZip": WH["citystatezip"],
-        "FromSIDNum": WH["sid"],
-        "3rdParty": "X", "PrePaid": "", "Collect": "",
-        "BOLnum": bol_num,
-        "CarrierName": carrier_name_final,
-        "SCAC": scac_from_shipclass,
-        "PRO": tracking.get("TrackingNumber", ""),
-        "CustomerOrderNumber": custom_code,
-        "BillInstructions": f"PO#{oid or bol_num}",
-        "OrderNum1": custom_code,
-        "SpecialInstructions": "",
+        "SCAC": (WH.get("SCAC") or "FEDXG"),
+        "BILL_TO": BILL_NAME,
+        "Bill_address": BILL_ADDRESS,
+        "Bill_citystatezip": BILL_CITYSTATEZIP,
+        "FromName": WH.get("name",""),
+        "FromAddress": WH.get("addr",""),
+        "FromCityStateZip": WH.get("citystatezip",""),
+        "FromPhone": WH.get("tel",""),
+        "ToName": shipto_name or "",
+        "ToAddress": shipto_street or "",
+        "ToCityStateZip": f"{shipto_city}, {shipto_state} {shipto_zip}".strip().strip(","),
+        "ToPhone": _safe_get_nested(first, "To", "Phone", default=""),
+        "PO#": oid,
+        "PRO#": "",
+        "SCAC_code": (WH.get("SCAC") or "FEDXG"),
+        "Terms": "Prepaid",
+        "MasterBOL": "Yes",
+        "PrePaid": "X",
+        "Collect": "",
+        "3rdParty": "",
+        "FromFOB": "X",
+        "ToFOB": "",
+        "NumPkgs": str(total_pkgs) if total_pkgs else "",
         "TotalPkgs": str(total_pkgs) if total_pkgs else "",
         "Total_Weight": str(total_lb) if total_lb else "",
         "Date": datetime.now().strftime("%Y/%m/%d"),
@@ -378,82 +339,74 @@ def fill_pdf(row: dict, out_path: str):
         raise FileNotFoundError(f"找不到 BOL 模板：{TEMPLATE_PDF}")
     doc = fitz.open(TEMPLATE_PDF)
     for page in doc:
-        for w in (page.widgets() or []):
-            name = w.field_name
-            if name and name in row:
-                set_widget_value(w, name, row[name])
-    try: doc.need_appearances = True
-    except Exception: pass
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    doc.save(out_path, deflate=True, incremental=False, encryption=fitz.PDF_ENCRYPT_KEEP)
+        widgets = page.widgets()
+        if not widgets: continue
+        for w in widgets:
+            name = (w.field_name or "").strip()
+            if not name: continue
+            val = row.get(name, "")
+            set_widget_value(w, name, val)
+        page.apply_redactions()
+    doc.save(out_path)
     doc.close()
 
+def _desc_value_from_order(o):
+    od = o.get("OrderDetails") or {}
+    sku = _first_nonempty(od.get("SKU"), od.get("Sku"), od.get("ItemName2"), od.get("ItemName"), "")
+    return (sku or "Furniture")[:40]
 
-def _aggregate_items_by_sku(group):
-    """Sum quantities per ItemSKU across all orders in the group."""
-    sku_qty = {}
-    for od in group:
-        items = od.get("OrderItems") or []
-        if isinstance(items, dict):
-            items = [items]
-        for it in items:
-            sku = (it.get("ItemSKU") or "").strip()
-            if not sku:
-                continue
-            try:
-                q = int(it.get("Quantity") or 0)
-            except Exception:
-                q = 0
-            if q <= 0:
-                continue
-            sku_qty[sku] = sku_qty.get(sku, 0) + q
-    items_arr = [{"product_sku": sku, "quantity": qty} for sku, qty in sku_qty.items()]
-    return items_arr
-
-def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_str: str) -> dict:
-    """Build the JSON params for the WMS createOrder API from a Teapplix grouped order (same OriginalTxnId)."""
-    first = group[0]
+def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_str: str):
+    first = group[0] if group else {}
     to = first.get("To") or {}
-    od = first.get("OrderDetails") or {}
-    # Address mapping
-    province = (to.get("State") or "").strip()
-    city = (to.get("City") or "").strip()
-    street = (to.get("Street") or "").strip()
-    street2 = (to.get("Street2") or "").strip()
-    zipcode = (to.get("ZipCode") or "").strip()
-    company = (to.get("Company") or "").strip()
-    name = (to.get("Name") or "").strip()
-    phone = (to.get("PhoneNumber") or "").strip()
-    shipclass = (od.get("ShipClass") or "").strip()
+    street = _first_nonempty(to.get("Address1"), to.get("Street"), to.get("Addr1"))
+    street2 = _first_nonempty(to.get("Address2"), to.get("Addr2"))
+    city = _first_nonempty(to.get("City"), to.get("Town"))
+    province = _first_nonempty(to.get("State"), to.get("Province"))
+    zipcode = _first_nonempty(to.get("Zip"), to.get("ZipCode"))
+    company = _first_nonempty(to.get("Company"), to.get("BuyerName"))
+    name = _first_nonempty(to.get("FullName"), to.get("Name"), to.get("Receiver"))
+    phone = _first_nonempty(to.get("Phone"), to.get("Tel"))
 
-    # Items (merge by SKU)
-    items = _aggregate_items_by_sku(group)
+    items = []
+    for o in group:
+        od = o.get("OrderDetails") or {}
+        sku = _first_nonempty(od.get("SKU"), od.get("Sku"), od.get("ItemName2"), od.get("ItemName"))
+        qty = int(_first_nonempty(od.get("Quantity"), 1))
+        if sku:
+            items.append({"product_sku": str(sku).strip(), "quantity": int(qty)})
 
-    # Fields using OriginalTxnId should be test-prefixed for this testing phase
-    test_oid = f"test-{oid}".strip()
+    cfg = WAREHOUSES.get(wh_key) or {}
+    warehouse_code = cfg.get("WAREHOUSE_CODE", "")
+
+    # 依 Teapplix ship class 塞入 platform_shop（可在 UI 修改）
+    od1 = first.get("OrderDetails") or {}
+    shipclass = str(od1.get("ShipClass") or "").strip()
+
+    # 測試：tracking_no 放 test + oid
+    test_oid = f"test-{oid}"
 
     params = {
-        "platform": "OTHER",
-        "allocated_auto": "0",
-        "warehouse_code": WMS_CONFIGS.get(wh_key, {}).get("WAREHOUSE_CODE", ""),
-        "shipping_method": "CUSTOMER_SHIP",
-        "reference_no": test_oid,                # ← test + OriginalTxnId
-        "order_desc": f"pick up: {pickup_date_str}" if pickup_date_str else "",
-        "remark": "",
-        "country_code": "US",
-        "province": province,
-        "city": city,
-        "district": city,                        # ← 同 City
-        "address1": street,
-        "address2": street2,
-        "address3": "",
-        "zipcode": zipcode,
-        "company": company,
-        "name": name,
-        "phone": phone,
-        "cell_phone": "",
-        "phone_extension": "",
-        "email": "",
+        "reference_no": oid,                     # ← 必填：你的 PO/單號
+        "order_desc": f"pick up: {pickup_date_str}",
+        "warehouse_code": warehouse_code,        # ← WMS 倉別代碼（可在 UI 改）
+        "to_address": {
+            "country_code": "US",
+            "province": province,
+            "city": city,
+            "district": city,                        # ← 同 City
+            "address1": street,
+            "address2": street2,
+            "address3": "",
+            "zipcode": zipcode,
+            "company": company,
+            "name": name,
+            "phone": phone,
+            "cell_phone": "",
+            "phone_extension": "",
+            "email": "",
+            "is_por": "0",
+            "is_door": "1",
+        },
         "platform_shop": shipclass,
         "items": items,
         "tracking_no": test_oid,                 # ← test + OriginalTxnId
@@ -470,29 +423,23 @@ def _extract_wms_json(resp_text: str) -> dict:
         return {}
 
     # 找出第一個 "{" 開始到最後一個 "}" 結束的 JSON 片段
-    start = resp_text.find("{")
-    end = resp_text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-
-    json_str = resp_text[start:end + 1]
-
-    # 嘗試解析
-    import json
     try:
-        return json.loads(json_str)
-    except Exception:
-        # 有時 SOAP 裡會帶轉義符號
-        j2 = json_str.replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
+        first = resp_text.find("{")
+        last  = resp_text.rfind("}")
+        if first == -1 or last == -1 or last <= first:
+            return {}
+        j = resp_text[first:last+1]
+        j2 = j.replace("&quot;", '"').replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
         try:
             return json.loads(j2)
         except Exception:
             return {}
-
+    except Exception:
+        return {}
 
 def push_group_to_wms(oid: str, group: list, wh_key: str, pickup_date_str: str):
     """Send the grouped order to the WMS endpoint for the given warehouse key."""
-    cfg = WMS_CONFIGS.get(wh_key) or {}
+    cfg = WAREHOUSES.get(wh_key) or {}
     endpoint = cfg.get("ENDPOINT_URL") or ""
     app_token = cfg.get("APP_TOKEN") or ""
     app_key = cfg.get("APP_KEY") or ""
@@ -528,12 +475,10 @@ st.markdown("""
 2. ABCD
 """)
 
-if not TEAPPLIX_TOKEN:
-    st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
-    st.stop()
-
-# ---- 側邊：抓取天數 + 按鈕（搬到這裡） ----
-days = st.sidebar.selectbox("抓取天數（一般抓單）", options=[1,2,3,4,5,6,7], index=2, help="套用於『抓取訂單』")
+# ---- 側邊：抓取訂單（最近 N 天） ----
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧲 抓取訂單（一般）")
+days = st.sidebar.selectbox("天數", options=[1,2,3,4,5,6,7], index=2, help="套用於『抓取訂單』")
 if st.sidebar.button("抓取訂單", width="stretch"):
     st.session_state["orders_raw"] = fetch_orders(days)
     st.session_state.pop("table_rows_override", None)
@@ -541,12 +486,9 @@ if st.sidebar.button("抓取訂單", width="stretch"):
 
 
 # ---- 側邊：WMS 推送設定 ----
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚚 WMS 推送（測試）")
-pickup_date = st.sidebar.date_input("Pick up date", value=datetime.now(ZoneInfo("America/Phoenix")).date())
-st.sidebar.caption("上方日期會寫入 order_desc = 'pick up: YYYY-MM-DD'")
+# （已改：取件日改到人工修改區，預設兩天後）
 
-# ---- 側邊：以 PO 搜尋（固定 14 天） ----
+# ---- 側邊：以 PO 搜尋（最近 14 天） ----
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔎 PO 搜尋（最近 14 天）")
 po_text = st.sidebar.text_area(
@@ -580,16 +522,25 @@ if st.sidebar.button("搜尋 PO（14 天內）", width="stretch"):
 orders_raw = st.session_state.get("orders_raw", None)
 
 def build_table_rows_from_orders(orders_raw):
-    grouped = group_by_original_txn(orders_raw or [])
+    grouped = {}
+    for o in orders_raw or []:
+        oid = str(o.get("OriginalTxnId") or o.get("original_txn_id") or "").strip()
+        if not oid: 
+            # 沒有 OriginalTxnId 的資料忽略
+            continue
+        grouped.setdefault(oid, []).append(o)
+
     table_rows = []
     for oid, group in grouped.items():
+        # 預設倉
+        wh_key = "CA 91789"
         first = group[0]
-        od = first.get("OrderDetails") or {}
-        scac = (od.get("ShipClass") or "").strip()
-        sku8 = _sku8_from_order(first)
+        od1 = first.get("OrderDetails") or {}
         order_date_str = _parse_order_date_str(first)
+        sku8 = _sku8_from_order(first)
+        scac = (WAREHOUSES.get(wh_key) or {}).get("SCAC") or "FEDXG"
         table_rows.append({
-            "Select": True,
+            "Select": False,
             "Warehouse": "CA 91789",
             "OriginalTxnId": oid,
             "SKU8": sku8,
@@ -621,22 +572,21 @@ if orders_raw:
                     if r2.get("Select"): r2["Warehouse"] = bulk_wh
                     new_rows.append(r2)
             st.session_state["table_rows_override"] = new_rows
-            table_rows = new_rows
-            st.success("已套用批次倉庫變更。")
 
-    # 合併表（允許改 Warehouse / 勾選）
+    # 顯示資料表
+    source_rows = st.session_state.get("table_rows_override") or table_rows
     edited = st.data_editor(
-        st.session_state.get("table_rows_override", table_rows),
-        num_rows="fixed",
-        hide_index=True,
+        source_rows,
+        use_container_width=True,
+        num_rows="dynamic",
         column_config={
-            "Select": st.column_config.CheckboxColumn("選取", default=True),
+            "Select": st.column_config.CheckboxColumn("選取", help="勾選要處理的列"),
             "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
-            "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
-            "SKU8": st.column_config.TextColumn("SKU", disabled=True),
-            "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
-            "ToState": st.column_config.TextColumn("州", disabled=True),
-            "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
+            "OriginalTxnId": "PO / OriginalTxnId",
+            "SKU8": "SKU(前8)",
+            "SCAC": "SCAC",
+            "ToState": "州",
+            "OrderDate": "Order Date",
         },
         key="orders_table",
     )
@@ -681,93 +631,93 @@ if orders_raw:
             else:
                 st.warning("沒有產生任何檔案。")
 
-    # 推送到 WMS（測試）
-    if st.button("推送到 WMS（選取列，測試）", type="primary", use_container_width=True):
+    # ======== 先建立預設上傳參數 -> 顯示人工修改 UI -> 再送出 ========
+    if st.button("推送到 WMS（先人工修改）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
         else:
-            results = []
+            edit_map = {}
             for row_preview in selected:
                 oid = row_preview["OriginalTxnId"]
                 wh_key = row_preview["Warehouse"]
                 group = grouped.get(oid, [])
                 if not group:
                     continue
-                # 將 Phoenix 日期格式化為 YYYY-MM-DD
-                pickup_str = str(pickup_date)
-                res = push_group_to_wms(oid, group, wh_key, pickup_str)
-                results.append({"PO": oid, "Warehouse": wh_key, **res})
-            st.success(f"已嘗試推送 {len(results)} 筆合併單至 WMS。")
-            st.json(results)
+                pickup_str = default_pickup_date_str()
+                params = build_wms_params_from_group(oid, group, wh_key, pickup_str)
+                edit_map[oid] = {"Warehouse": wh_key, "params": params}
+            st.session_state["wms_edit_map"] = edit_map
+            st.session_state["wms_groups"] = grouped
+            st.success(f"已建立 {len(edit_map)} 筆預設上傳資料，請在下方逐筆人工修改後送出。")
 
-            # --- Retry UI for SKU-not-exist errors ---
-            retry_items = []
-            for r in results:
-                js = r.get("parsed") or {}
-                msg = (js.get("message") or js.get("Error", {}).get("errMessage") or r.get("response") or "")
-                if isinstance(msg, str) and ("不存在" in msg or "not exist" in msg.lower() or "不存在" in r.get("response","")):
-                    retry_items.append(r)
+    wms_edit_map = st.session_state.get("wms_edit_map")
+    if wms_edit_map:
+        st.markdown("### 📝 推送前人工修改")
+        st.caption("每筆資料都可修改（含取件日期、SKU/數量等），確認後再送出。")
 
-            if retry_items:
-                st.warning(f"有 {len(retry_items)} 筆訂單在 WMS 回報『SKU 不存在』，請人工修正後重送：")
-                for r in retry_items:
-                    p = r["params"]
-                    oid = p.get("reference_no", "")
-                    with st.expander(f"🛠 修正並重送：{oid}"):
-                        # show current params for reference
-                        st.caption("原上傳參數（可供參考，請直接在下方修正 SKU / 數量 再重送）")
-                        st.json(p)
+        for oid, rec in wms_edit_map.items():
+            p = rec["params"]
+            import re as _re
+            m = _re.search(r"pick up:\s*(\d{4}-\d{2}-\d{2})", p.get("order_desc") or "")
+            pickup_default = m.group(1) if m else default_pickup_date_str()
 
-                        # editable items
-                        new_items = []
-                        for idx, it in enumerate(p.get("items", [])):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                new_sku = st.text_input(f"product_sku #{idx+1}", value=it.get("product_sku",""), key=f"{oid}_sku_{idx}")
-                            with col2:
-                                new_qty = st.number_input(f"quantity #{idx+1}", value=int(it.get("quantity",1)), min_value=1, step=1, key=f"{oid}_qty_{idx}")
-                            new_items.append({"product_sku": new_sku.strip(), "quantity": int(new_qty)})
+            with st.expander(f"🛠 人工修改：{oid}"):
+                col_pd, col_wc = st.columns(2)
+                with col_pd:
+                    new_pickup_date = st.date_input("Pick up date", value=datetime.fromisoformat(pickup_default).date(), key=f"{oid}_pickup")
+                with col_wc:
+                    new_wh_code = st.text_input("warehouse_code", value=p.get("warehouse_code",""), key=f"{oid}_whc")
 
-                        # allow editing of a few common fields
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            new_wh_code = st.text_input("warehouse_code", value=p.get("warehouse_code",""), key=f"{oid}_whc")
-                            new_tracking = st.text_input("tracking_no", value=p.get("tracking_no",""), key=f"{oid}_trk")
-                        with c2:
-                            new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
-                            new_desc = st.text_input("order_desc", value=p.get("order_desc",""), key=f"{oid}_desc")
+                c1, c2 = st.columns(2)
+                with c1:
+                    new_tracking = st.text_input("tracking_no", value=p.get("tracking_no",""), key=f"{oid}_trk")
+                    new_platform_shop = st.text_input("platform_shop", value=p.get("platform_shop",""), key=f"{oid}_pshop")
+                with c2:
+                    new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
+                    new_remark = st.text_input("remark", value=p.get("remark",""), key=f"{oid}_remark")
 
-                        if st.button("📤 重送此筆", key=f"resend_{oid}"):
-                            # build new payload
-                            new_params = dict(p)
-                            new_params.update({
-                                "warehouse_code": new_wh_code.strip(),
-                                "tracking_no": new_tracking.strip(),
-                                "reference_no": new_ref.strip(),
-                                "order_desc": new_desc,
-                                "items": new_items,
-                            })
-                            # resolve warehouse key by matching code inside WMS_CONFIGS
-                            target_wh_key = None
-                            for k, cfg in WMS_CONFIGS.items():
-                                if cfg.get("WAREHOUSE_CODE") == new_params.get("warehouse_code"):
-                                    target_wh_key = k
-                                    break
-                            # fallback: keep original Warehouse from preview row if present
-                            if not target_wh_key:
-                                target_wh_key = r.get("Warehouse", "NJ 08816")
+                st.markdown("**Items**")
+                new_items = []
+                for idx, it in enumerate(p.get("items", [])):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        new_sku = st.text_input(f"product_sku #{idx+1}", value=it.get("product_sku",""), key=f"{oid}_sku_{idx}")
+                    with col2:
+                        new_qty = st.number_input(f"quantity #{idx+1}", value=int(it.get("quantity",1)), min_value=1, step=1, key=f"{oid}_qty_{idx}")
+                    new_items.append({"product_sku": new_sku.strip(), "quantity": int(new_qty)})
 
-                            cfg = WMS_CONFIGS.get(target_wh_key, {})
-                            try:
-                                resp2 = send_create_order(cfg.get("ENDPOINT_URL",""), cfg.get("APP_TOKEN",""), cfg.get("APP_KEY",""), new_params, service="createOrder")
-                                text2 = resp2.text[:5000]
-                                parsed2 = _extract_wms_json(text2)
-                                st.info(f"重送完成：HTTP {resp2.status_code}")
-                                st.text_area("回應（前 5000 字）", text2, height=160)
-                                if parsed2:
-                                    st.json(parsed2)
-                            except Exception as e:
-                                st.error(f"重送失敗：{e}")
+                if st.button("📤 送出此筆", key=f"send_{oid}"):
+                    new_order_desc = f"pick up: {new_pickup_date.isoformat()}"
+                    new_params = dict(p)
+                    new_params.update({
+                        "warehouse_code": new_wh_code.strip(),
+                        "tracking_no": new_tracking.strip(),
+                        "reference_no": new_ref.strip(),
+                        "order_desc": new_order_desc,
+                        "platform_shop": new_platform_shop.strip(),
+                        "remark": new_remark,
+                        "items": new_items,
+                    })
+
+                    target_wh_key = None
+                    for k, cfg in WAREHOUSES.items():
+                        if cfg.get("WAREHOUSE_CODE") == new_params.get("warehouse_code"):
+                            target_wh_key = k
+                            break
+                    if not target_wh_key:
+                        target_wh_key = rec.get("Warehouse", "NJ 08816")
+
+                    cfg = WAREHOUSES.get(target_wh_key, {})
+                    try:
+                        resp2 = send_create_order(cfg.get("ENDPOINT_URL",""), cfg.get("APP_TOKEN",""), cfg.get("APP_KEY",""), new_params, service="createOrder")
+                        text2 = resp2.text[:5000]
+                        parsed2 = _extract_wms_json(text2)
+                        st.info(f"HTTP {resp2.status_code}")
+                        st.text_area("回應（前 5000 字）", text2, height=160)
+                        if parsed2:
+                            st.json(parsed2)
+                    except Exception as e:
+                        st.error(f"上傳失敗：{e}")
 else:
     st.info("請先在左側按『抓取訂單』或『搜尋 PO（14 天內）』。")
