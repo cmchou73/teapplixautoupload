@@ -20,7 +20,7 @@ import fitz  # PyMuPDF
 from importorder import send_create_order  # endpoint, app_token, app_key, params, service
 
 # ---------- 應用設定 ----------
-APP_TITLE = "Teapplix HD LTL BOL 產生器"
+APP_TITLE = "HD LTL Order推送到海外倉和 BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
 BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"  # ← 保留 GET + 固定路徑
