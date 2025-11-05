@@ -6,8 +6,6 @@ from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
-import re
-from importorder import build_soap_envelope, requests_session_with_retry, call_soap, send_create_order
 
 try:
     from zoneinfo import ZoneInfo
@@ -55,24 +53,6 @@ WAREHOUSES = {
         "addr": _sec("W2_ADDR", "10 Main St"),
         "citystatezip": _sec("W2_CITYSTATEZIP", "East Brunswick, NJ 08816"),
         "sid": _sec("W2_SID", "NJ-001"),
-    },
-}
-
-
-# ---------- WMS API configs (by warehouse) ----------
-WMS_CONFIGS = {
-    "CA 91789": {
-        # placeholders; fill with real values in secrets/.env if/when needed
-        "ENDPOINT_URL": _sec("W1_WMS_ENDPOINT", ""),
-        "APP_TOKEN": _sec("W1_WMS_APP_TOKEN", ""),
-        "APP_KEY": _sec("W1_WMS_APP_KEY", ""),
-        "WAREHOUSE_CODE": _sec("W1_WMS_CODE", "CAW"),
-    },
-    "NJ 08816": {
-        "ENDPOINT_URL": _sec("W2_WMS_ENDPOINT", ""),
-        "APP_TOKEN": _sec("W2_WMS_APP_TOKEN", ""),
-        "APP_KEY": _sec("W2_WMS_APP_KEY", ""),
-        "WAREHOUSE_CODE": _sec("W2_WMS_CODE", "NJW"),
     },
 }
 
@@ -388,128 +368,6 @@ def fill_pdf(row: dict, out_path: str):
     doc.save(out_path, deflate=True, incremental=False, encryption=fitz.PDF_ENCRYPT_KEEP)
     doc.close()
 
-
-def _aggregate_items_by_sku(group):
-    """Sum quantities per ItemSKU across all orders in the group."""
-    sku_qty = {}
-    for od in group:
-        items = od.get("OrderItems") or []
-        if isinstance(items, dict):
-            items = [items]
-        for it in items:
-            sku = (it.get("ItemSKU") or "").strip()
-            if not sku:
-                continue
-            try:
-                q = int(it.get("Quantity") or 0)
-            except Exception:
-                q = 0
-            if q <= 0:
-                continue
-            sku_qty[sku] = sku_qty.get(sku, 0) + q
-    items_arr = [{"product_sku": sku, "quantity": qty} for sku, qty in sku_qty.items()]
-    return items_arr
-
-def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_str: str) -> dict:
-    """Build the JSON params for the WMS createOrder API from a Teapplix grouped order (same OriginalTxnId)."""
-    first = group[0]
-    to = first.get("To") or {}
-    od = first.get("OrderDetails") or {}
-    # Address mapping
-    province = (to.get("State") or "").strip()
-    city = (to.get("City") or "").strip()
-    street = (to.get("Street") or "").strip()
-    street2 = (to.get("Street2") or "").strip()
-    zipcode = (to.get("ZipCode") or "").strip()
-    company = (to.get("Company") or "").strip()
-    name = (to.get("Name") or "").strip()
-    phone = (to.get("PhoneNumber") or "").strip()
-    shipclass = (od.get("ShipClass") or "").strip()
-
-    # Items (merge by SKU)
-    items = _aggregate_items_by_sku(group)
-
-    # Fields using OriginalTxnId should be test-prefixed for this testing phase
-    test_oid = f"test-{oid}".strip()
-
-    params = {
-        "platform": "OTHER",
-        "allocated_auto": "0",
-        "warehouse_code": WMS_CONFIGS.get(wh_key, {}).get("WAREHOUSE_CODE", ""),
-        "shipping_method": "CUSTOMER_SHIP",
-        "reference_no": test_oid,                # ← test + OriginalTxnId
-        "order_desc": f"pick up: {pickup_date_str}" if pickup_date_str else "",
-        "remark": "",
-        "country_code": "US",
-        "province": province,
-        "city": city,
-        "district": city,                        # ← 同 City
-        "address1": street,
-        "address2": street2,
-        "address3": "",
-        "zipcode": zipcode,
-        "company": company,
-        "name": name,
-        "phone": phone,
-        "cell_phone": "",
-        "phone_extension": "",
-        "email": "",
-        "platform_shop": shipclass,
-        "items": items,
-        "tracking_no": test_oid,                 # ← test + OriginalTxnId
-    }
-    return params
-
-
-def _extract_wms_json(resp_text: str) -> dict:
-    """
-    Try to extract JSON segment from SOAP response text.
-    Looks for the first {...} block and parses it.
-    """
-    if not isinstance(resp_text, str) or not resp_text:
-        return {}
-
-    # 找出第一個 "{" 開始到最後一個 "}" 結束的 JSON 片段
-    start = resp_text.find("{")
-    end = resp_text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-
-    json_str = resp_text[start:end + 1]
-
-    # 嘗試解析
-    import json
-    try:
-        return json.loads(json_str)
-    except Exception:
-        # 有時 SOAP 裡會帶轉義符號
-        j2 = json_str.replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
-        try:
-            return json.loads(j2)
-        except Exception:
-            return {}
-
-
-
-def push_group_to_wms(oid: str, group: list, wh_key: str, pickup_date_str: str):
-    """Send the grouped order to the WMS endpoint for the given warehouse key."""
-    cfg = WMS_CONFIGS.get(wh_key) or {}
-    endpoint = cfg.get("ENDPOINT_URL") or ""
-    app_token = cfg.get("APP_TOKEN") or ""
-    app_key = cfg.get("APP_KEY") or ""
-
-    if not (endpoint and app_token and app_key):
-        return {"ok": False, "message": f"{wh_key} WMS config is missing (endpoint/app_token/app_key)."}
-
-    params = build_wms_params_from_group(oid, group, wh_key, pickup_date_str)
-    try:
-        resp = send_create_order(endpoint, app_token, app_key, params, service="createOrder")
-        text = resp.text[:5000]
-        parsed = _extract_wms_json(text)
-        return {"ok": (200 <= resp.status_code < 300), "status": resp.status_code, "response": text, "parsed": parsed, "params": params}
-    except Exception as e:
-        return {"ok": False, "message": f"request error: {e}", "params": params}
-
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
@@ -539,13 +397,6 @@ if st.sidebar.button("抓取訂單", width="stretch"):
     st.session_state["orders_raw"] = fetch_orders(days)
     st.session_state.pop("table_rows_override", None)
     st.sidebar.success(f"已抓取最近 {days} 天的一般訂單。")
-
-
-# ---- 側邊：WMS 推送設定 ----
-st.sidebar.markdown("---")
-st.sidebar.subheader("🚚 WMS 推送（測試）")
-pickup_date = st.sidebar.date_input("Pick up date", value=datetime.now(ZoneInfo("America/Phoenix")).date())
-st.sidebar.caption("上方日期會寫入 order_desc = 'pick up: YYYY-MM-DD'")
 
 # ---- 側邊：以 PO 搜尋（固定 14 天） ----
 st.sidebar.markdown("---")
@@ -681,94 +532,5 @@ if orders_raw:
                 )
             else:
                 st.warning("沒有產生任何檔案。")
-
-    # 推送到 WMS（測試）
-    if st.button("推送到 WMS（選取列，測試）", type="primary", use_container_width=True):
-        selected = [r for r in edited if r.get("Select")]
-        if not selected:
-            st.warning("尚未選取任何訂單。")
-        else:
-            results = []
-            for row_preview in selected:
-                oid = row_preview["OriginalTxnId"]
-                wh_key = row_preview["Warehouse"]
-                group = grouped.get(oid, [])
-                if not group:
-                    continue
-                # 將 Phoenix 日期格式化為 YYYY-MM-DD
-                pickup_str = str(pickup_date)
-                res = push_group_to_wms(oid, group, wh_key, pickup_str)
-                results.append({"PO": oid, "Warehouse": wh_key, **res})
-            st.success(f"已嘗試推送 {len(results)} 筆合併單至 WMS。")
-            st.json(results)
-
-            # --- Retry UI for SKU-not-exist errors ---
-            retry_items = []
-            for r in results:
-                js = r.get("parsed") or {}
-                msg = (js.get("message") or js.get("Error", {}).get("errMessage") or r.get("response") or "")
-                if isinstance(msg, str) and ("不存在" in msg or "not exist" in msg.lower() or "不存在" in r.get("response","")):
-                    retry_items.append(r)
-
-            if retry_items:
-                st.warning(f"有 {len(retry_items)} 筆訂單在 WMS 回報『SKU 不存在』，請人工修正後重送：")
-                for r in retry_items:
-                    p = r["params"]
-                    oid = p.get("reference_no", "")
-                    with st.expander(f"🛠 修正並重送：{oid}"):
-                        # show current params for reference
-                        st.caption("原上傳參數（可供參考，請直接在下方修正 SKU / 數量 再重送）")
-                        st.json(p)
-
-                        # editable items
-                        new_items = []
-                        for idx, it in enumerate(p.get("items", [])):
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                new_sku = st.text_input(f"product_sku #{idx+1}", value=it.get("product_sku",""), key=f"{oid}_sku_{idx}")
-                            with col2:
-                                new_qty = st.number_input(f"quantity #{idx+1}", value=int(it.get("quantity",1)), min_value=1, step=1, key=f"{oid}_qty_{idx}")
-                            new_items.append({"product_sku": new_sku.strip(), "quantity": int(new_qty)})
-
-                        # allow editing of a few common fields
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            new_wh_code = st.text_input("warehouse_code", value=p.get("warehouse_code",""), key=f"{oid}_whc")
-                            new_tracking = st.text_input("tracking_no", value=p.get("tracking_no",""), key=f"{oid}_trk")
-                        with c2:
-                            new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
-                            new_desc = st.text_input("order_desc", value=p.get("order_desc",""), key=f"{oid}_desc")
-
-                        if st.button("📤 重送此筆", key=f"resend_{oid}"):
-                            # build new payload
-                            new_params = dict(p)
-                            new_params.update({
-                                "warehouse_code": new_wh_code.strip(),
-                                "tracking_no": new_tracking.strip(),
-                                "reference_no": new_ref.strip(),
-                                "order_desc": new_desc,
-                                "items": new_items,
-                            })
-                            # resolve warehouse key by matching code inside WMS_CONFIGS
-                            target_wh_key = None
-                            for k, cfg in WMS_CONFIGS.items():
-                                if cfg.get("WAREHOUSE_CODE") == new_params.get("warehouse_code"):
-                                    target_wh_key = k
-                                    break
-                            # fallback: keep original Warehouse from preview row if present
-                            if not target_wh_key:
-                                target_wh_key = r.get("Warehouse", "NJ 08816")
-
-                            cfg = WMS_CONFIGS.get(target_wh_key, {})
-                            try:
-                                resp2 = send_create_order(cfg.get("ENDPOINT_URL",""), cfg.get("APP_TOKEN",""), cfg.get("APP_KEY",""), new_params, service="createOrder")
-                                text2 = resp2.text[:5000]
-                                parsed2 = _extract_wms_json(text2)
-                                st.info(f"重送完成：HTTP {resp2.status_code}")
-                                st.text_area("回應（前 5000 字）", text2, height=160)
-                                if parsed2:
-                                    st.json(parsed2)
-                            except Exception as e:
-                                st.error(f"重送失敗：{e}")
 else:
     st.info("請先在左側按『抓取訂單』或『搜尋 PO（14 天內）』。")
