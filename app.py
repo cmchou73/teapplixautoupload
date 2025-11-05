@@ -1,4 +1,4 @@
-# app.py — Teapplix HD LTL BOL 產生器 + 推送前人工修改（整合 importorder.py 可用版本）
+# app.py — Teapplix HD LTL BOL 產生器 + 推送前人工修改（整合 importorder.py 可用版本 & 修正成功偵測）
 import os
 import io
 import zipfile
@@ -16,14 +16,14 @@ except ImportError:
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-# ★ 直接採用你可用的 SOAP 封裝與送單邏輯
-from importorder import send_create_order  # -> endpoint, app_token, app_key, params, service  :contentReference[oaicite:1]{index=1}
+# ★ 使用你可用的 SOAP 封裝與送單邏輯
+from importorder import send_create_order  # endpoint, app_token, app_key, params, service
 
 # ---------- 應用設定 ----------
 APP_TITLE = "Teapplix HD LTL BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
-BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"  # ← 依你提供版本保留 GET + 固定路徑
+BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"  # ← 保留 GET + 固定路徑
 STORE_KEY = "HD"
 SHIPPED_DEFAULT = "0"   # 一般抓單預設：未出貨
 PAGE_SIZE = 500
@@ -106,8 +106,10 @@ def get_headers():
     return hdr
 
 def oz_to_lb(oz):
-    try: return round(float(oz)/16.0, 2)
-    except Exception: return None
+    try:
+        return round(float(oz)/16.0, 2)
+    except Exception:
+        return None
 
 def summarize_packages(order):
     details = order.get("ShippingDetails") or []
@@ -166,8 +168,10 @@ def _sku8_from_order(order):
 
 def _qty_from_order(order):
     it = _first_item(order)
-    try: return int(it.get("Quantity") or 0)
-    except Exception: return 0
+    try:
+        return int(it.get("Quantity") or 0)
+    except Exception:
+        return 0
 
 def _sum_group_totals(group):
     total_pkgs = 0
@@ -209,6 +213,25 @@ def _parse_order_date_str(first_order):
         dt = dt.replace(tzinfo=tz_phx)
     dt_phx = dt.astimezone(tz_phx)
     return dt_phx.strftime("%m/%d/%y")
+
+# ---- 解析 SOAP 內 JSON（上移到此，避免未定義） ----
+def _try_extract_json(resp_text: str):
+    if not isinstance(resp_text, str) or not resp_text:
+        return {}
+    start = resp_text.find("{")
+    end = resp_text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    import json
+    js = resp_text[start:end+1]
+    try:
+        return json.loads(js)
+    except Exception:
+        j2 = js.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
+        try:
+            return json.loads(j2)
+        except Exception:
+            return {}
 
 # ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
@@ -429,7 +452,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     shipclass = (od.get("ShipClass") or "").strip()
 
     items = _aggregate_items_by_sku(group)
-    test_oid = f"test-{oid}".strip()
+    test_oid = f"test1-{oid}".strip()
 
     params = {
         "platform": "OTHER",
@@ -703,36 +726,26 @@ if orders_raw:
                         st.error(f"{target_wh_key} WMS 設定不完整（endpoint/app_token/app_key）。")
                     else:
                         try:
-                            # ★ 直接用你可用的 send_create_order（importorder.py）
                             resp2 = send_create_order(endpoint, app_token, app_key, new_params, service=WMS_SERVICE)
                             text2 = resp2.text[:5000]
-                            st.info(f"HTTP {resp2.status_code}")
                             st.text_area("回應（前 5000 字）", text2, height=160)
 
-                            # 嘗試抓 JSON 片段（可選）
+                            # 嘗試抓 JSON 片段並判斷成功與否
                             parsed2 = _try_extract_json(text2)
                             if parsed2:
                                 st.json(parsed2)
+                                # 成功條件：ask=Success 或 error_code=0
+                                if (str(parsed2.get("ask", "")).lower() == "success") or (str(parsed2.get("error_code", "")) == "0"):
+                                    st.success("✅ WMS 上傳成功！")
+                                else:
+                                    st.warning("⚠️ WMS 回傳非成功狀態，請檢查上方 JSON/回應內容。")
+                            else:
+                                # 沒抓到 JSON，但若關鍵字含 Success 也當成功提示
+                                if ("\"ask\":\"Success\"" in text2) or ("\"message\":\"Success\"" in text2):
+                                    st.success("✅ WMS 上傳成功！")
+                                else:
+                                    st.info(f"HTTP {resp2.status_code}，請檢查回應內容。")
                         except Exception as e:
                             st.error(f"上傳失敗：{e}")
 else:
     st.info("請先在左側按『抓取訂單』或『搜尋 PO（14 天內）』。")
-
-# ---- 解析 SOAP 內 JSON（可選） ----
-def _try_extract_json(resp_text: str):
-    if not isinstance(resp_text, str) or not resp_text:
-        return {}
-    start = resp_text.find("{")
-    end = resp_text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-    import json
-    js = resp_text[start:end+1]
-    try:
-        return json.loads(js)
-    except Exception:
-        j2 = js.replace("&quot;", '"').replace("&lt;", "<").replace("&gt;", ">")
-        try:
-            return json.loads(j2)
-        except Exception:
-            return {}
