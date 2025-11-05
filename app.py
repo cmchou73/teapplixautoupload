@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 import requests
 import streamlit as st
+import re
 from importorder import build_soap_envelope, requests_session_with_retry, call_soap, send_create_order
 
 try:
