@@ -725,7 +725,7 @@ if orders_raw:
                     new_platform_shop = st.text_input("platform_shop", value=p.get("platform_shop",""), key=f"{oid}_pshop")
                 with c2:
                     new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
-                    new_remark = st.text_input("remark", value=p.get("remark",""), key=f"{oid}_remark")
+                    new_shipping_method = st.text_input("shipping_method", value=p.get("shipping_method",""), key=f"{oid}_shipping_method")
 
                 st.markdown("**Items**")
                 new_items = []
@@ -746,7 +746,7 @@ if orders_raw:
                         "reference_no": new_ref.strip(),
                         "order_desc": new_order_desc,
                         "platform_shop": new_platform_shop.strip(),
-                        "remark": new_remark,
+                        "shipping_method": new_shipping_method,
                         "items": new_items,
                     })
 
