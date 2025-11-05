@@ -459,6 +459,36 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     }
     return params
 
+
+def _extract_wms_json(resp_text: str) -> dict:
+    """
+    Try to extract the JSON segment from the SOAP response, then parse and return as dict.
+    Returns {} if not found or parse error.
+    """
+    if not isinstance(resp_text, str) or not resp_text:
+        return {}
+    # common pattern: <response>{...}</response> or direct JSON within the text
+    # find first JSON object with "ask":
+    m = re.search(r'\{(?:[^{}]|(?R))*\}', resp_text)
+    if not m:
+        # fallback: between <response>...</response>
+        m2 = re.search(r'<response>(\{.*?\})</response>', resp_text, flags=re.DOTALL)
+        if not m2:
+            return {}
+        json_str = m2.group(1)
+    else:
+        json_str = m.group(0)
+    try:
+        return json.loads(json_str)
+    except Exception:
+        # try to unescape XML entities
+        j2 = json_str.replace('&quot;', '"').replace('&lt;', '<').replace('&gt;', '>')
+        try:
+            return json.loads(j2)
+        except Exception:
+            return {}
+
+
 def push_group_to_wms(oid: str, group: list, wh_key: str, pickup_date_str: str):
     """Send the grouped order to the WMS endpoint for the given warehouse key."""
     cfg = WMS_CONFIGS.get(wh_key) or {}
@@ -473,7 +503,8 @@ def push_group_to_wms(oid: str, group: list, wh_key: str, pickup_date_str: str):
     try:
         resp = send_create_order(endpoint, app_token, app_key, params, service="createOrder")
         text = resp.text[:5000]
-        return {"ok": (200 <= resp.status_code < 300), "status": resp.status_code, "response": text, "params": params}
+        parsed = _extract_wms_json(text)
+        return {"ok": (200 <= resp.status_code < 300), "status": resp.status_code, "response": text, "parsed": parsed, "params": params}
     except Exception as e:
         return {"ok": False, "message": f"request error: {e}", "params": params}
 
@@ -668,5 +699,74 @@ if orders_raw:
                 results.append({"PO": oid, "Warehouse": wh_key, **res})
             st.success(f"已嘗試推送 {len(results)} 筆合併單至 WMS。")
             st.json(results)
+
+            # --- Retry UI for SKU-not-exist errors ---
+            retry_items = []
+            for r in results:
+                js = r.get("parsed") or {}
+                msg = (js.get("message") or js.get("Error", {}).get("errMessage") or r.get("response") or "")
+                if isinstance(msg, str) and ("不存在" in msg or "not exist" in msg.lower() or "不存在" in r.get("response","")):
+                    retry_items.append(r)
+
+            if retry_items:
+                st.warning(f"有 {len(retry_items)} 筆訂單在 WMS 回報『SKU 不存在』，請人工修正後重送：")
+                for r in retry_items:
+                    p = r["params"]
+                    oid = p.get("reference_no", "")
+                    with st.expander(f"🛠 修正並重送：{oid}"):
+                        # show current params for reference
+                        st.caption("原上傳參數（可供參考，請直接在下方修正 SKU / 數量 再重送）")
+                        st.json(p)
+
+                        # editable items
+                        new_items = []
+                        for idx, it in enumerate(p.get("items", [])):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                new_sku = st.text_input(f"product_sku #{idx+1}", value=it.get("product_sku",""), key=f"{oid}_sku_{idx}")
+                            with col2:
+                                new_qty = st.number_input(f"quantity #{idx+1}", value=int(it.get("quantity",1)), min_value=1, step=1, key=f"{oid}_qty_{idx}")
+                            new_items.append({"product_sku": new_sku.strip(), "quantity": int(new_qty)})
+
+                        # allow editing of a few common fields
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            new_wh_code = st.text_input("warehouse_code", value=p.get("warehouse_code",""), key=f"{oid}_whc")
+                            new_tracking = st.text_input("tracking_no", value=p.get("tracking_no",""), key=f"{oid}_trk")
+                        with c2:
+                            new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
+                            new_desc = st.text_input("order_desc", value=p.get("order_desc",""), key=f"{oid}_desc")
+
+                        if st.button("📤 重送此筆", key=f"resend_{oid}"):
+                            # build new payload
+                            new_params = dict(p)
+                            new_params.update({
+                                "warehouse_code": new_wh_code.strip(),
+                                "tracking_no": new_tracking.strip(),
+                                "reference_no": new_ref.strip(),
+                                "order_desc": new_desc,
+                                "items": new_items,
+                            })
+                            # resolve warehouse key by matching code inside WMS_CONFIGS
+                            target_wh_key = None
+                            for k, cfg in WMS_CONFIGS.items():
+                                if cfg.get("WAREHOUSE_CODE") == new_params.get("warehouse_code"):
+                                    target_wh_key = k
+                                    break
+                            # fallback: keep original Warehouse from preview row if present
+                            if not target_wh_key:
+                                target_wh_key = r.get("Warehouse", "NJ 08816")
+
+                            cfg = WMS_CONFIGS.get(target_wh_key, {})
+                            try:
+                                resp2 = send_create_order(cfg.get("ENDPOINT_URL",""), cfg.get("APP_TOKEN",""), cfg.get("APP_KEY",""), new_params, service="createOrder")
+                                text2 = resp2.text[:5000]
+                                parsed2 = _extract_wms_json(text2)
+                                st.info(f"重送完成：HTTP {resp2.status_code}")
+                                st.text_area("回應（前 5000 字）", text2, height=160)
+                                if parsed2:
+                                    st.json(parsed2)
+                            except Exception as e:
+                                st.error(f"重送失敗：{e}")
 else:
     st.info("請先在左側按『抓取訂單』或『搜尋 PO（14 天內）』。")
