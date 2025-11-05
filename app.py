@@ -725,7 +725,30 @@ if orders_raw:
                     new_platform_shop = st.text_input("platform_shop", value=p.get("platform_shop",""), key=f"{oid}_pshop")
                 with c2:
                     new_ref = st.text_input("reference_no", value=p.get("reference_no",""), key=f"{oid}_ref")
-                    new_remark = st.text_input("remark", value=p.get("remark",""), key=f"{oid}_remark")
+
+                    # 根據 warehouse_code 給可用 shipping method
+                    wh_code = p.get("warehouse_code", "")
+                    shipping_methods_by_wh = {
+                        "CAW": ["SELF_LTL-SINGLE", "ALL_SELF_LTL"],
+                        "NJW": ["CUSTOMER_SHIP"],
+                        "FURNITUREPROWH": ["SELF_LTL-SINGLE", "ALL_SELF_LTL", "CUSTOMER_SHIP"],  # 若你想手動測試用
+                    }
+                    available_methods = shipping_methods_by_wh.get(wh_code, ["CUSTOMER_SHIP"])
+
+                    # 取得原本 shipping_method，預設用 remark 或 params 內的
+                    current_shipping_method = p.get("shipping_method") or (p.get("remark","").replace('"shipping_method":','').strip() if '"shipping_method"' in p.get("remark","") else available_methods[0])
+
+                    new_shipping_method = st.selectbox(
+                        "shipping_method（可在該倉可用的 method 中選擇）",
+                        options=available_methods,
+                        index=available_methods.index(current_shipping_method) if current_shipping_method in available_methods else 0,
+                        key=f"{oid}_shipmethod",
+                    )
+
+                    # 自動更新 remark 顯示
+                    new_remark = f'"shipping_method": "{new_shipping_method}"'
+                    st.text_input("remark", value=new_remark, key=f"{oid}_remark", disabled=True)
+
 
                 st.markdown("**Items**")
                 new_items = []
