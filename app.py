@@ -655,7 +655,7 @@ if orders_raw:
                     sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
                     wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
                     scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
-                    filename = f"BOL_{oid}_{sku8}_{wh2}_{scac}.pdf".replace(" ", "")
+                    filename = f"{oid}.pdf".replace(" ", "")
                     out_path = os.path.join(OUTPUT_DIR, filename)
                     fill_pdf(row_dict, out_path)
                     made_files.append(out_path)
