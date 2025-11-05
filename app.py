@@ -1,12 +1,12 @@
-# app.py — Teapplix HD LTL BOL 產生器 + 推送/產生前人工修改（移除批次倉庫與倉庫欄）
+# app.py — Teapplix HD LTL BOL 產生器 + 推送前人工修改（整合 importorder.py 可用版本 & 修正成功偵測）
 import os
 import io
 import zipfile
 from datetime import datetime, timedelta
-import re
 
 import requests
 import streamlit as st
+import re
 
 try:
     from zoneinfo import ZoneInfo
@@ -16,16 +16,16 @@ except ImportError:
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
 
-# ★ SOAP/送單封裝
+# ★ 使用你可用的 SOAP 封裝與送單邏輯
 from importorder import send_create_order  # endpoint, app_token, app_key, params, service
 
 # ---------- 應用設定 ----------
 APP_TITLE = "Teapplix HD LTL BOL 產生器"
 TEMPLATE_PDF = "BOL.pdf"
 OUTPUT_DIR = "output_bols"
-BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"
+BASE_URL  = "https://api.teapplix.com/api2/OrderNotification"  # ← 保留 GET + 固定路徑
 STORE_KEY = "HD"
-SHIPPED_DEFAULT = "0"
+SHIPPED_DEFAULT = "0"   # 一般抓單預設：未出貨
 PAGE_SIZE = 500
 
 CHECKBOX_FIELDS   = {"MasterBOL", "Term_Pre", "Term_Collect", "Term_CustChk", "FromFOB", "ToFOB"}
@@ -45,6 +45,7 @@ AUTH_BEARER    = _sec("TEAPPLIX_AUTH_BEARER", "")
 X_API_KEY      = _sec("TEAPPLIX_X_API_KEY", "")
 PASSWORD       = _sec("APP_PASSWORD", "")
 
+# 送單服務名（沿用你可用版本的預設 createOrder；若供應商改名，可在 .env 或 secrets 覆寫）
 WMS_SERVICE = _sec("WMS_SERVICE", "createOrder")
 
 # UI 倉庫基本資料（BOL 用）
@@ -101,7 +102,7 @@ def get_headers():
     if AUTH_BEARER:
         hdr["Authorization"] = f"Bearer {AUTH_BEARER}"
     if X_API_KEY:
-        hdr["x-api-key"] = X_API_KEY
+        hdr["x-api-key"] = X_API_KEY  # 依你可用檔案的小寫 key
     return hdr
 
 def oz_to_lb(oz):
@@ -213,6 +214,7 @@ def _parse_order_date_str(first_order):
     dt_phx = dt.astimezone(tz_phx)
     return dt_phx.strftime("%m/%d/%y")
 
+# ---- 解析 SOAP 內 JSON（上移到此，避免未定義） ----
 def _try_extract_json(resp_text: str):
     if not isinstance(resp_text, str) or not resp_text:
         return {}
@@ -231,7 +233,7 @@ def _try_extract_json(resp_text: str):
         except Exception:
             return {}
 
-# ---------- API：抓單 ----------
+# ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
     page = 1
@@ -264,9 +266,9 @@ def fetch_orders(days: int):
         page += 1
     return all_orders
 
-# ---------- API：以 PO 搜尋（固定 14 天） ----------
+# ---------- API：以 PO(OriginalTxnId) 查詢（固定最近 14 天 + 嚴格等於過濾） ----------
 def fetch_orders_by_pos(pos_list, shipped: str):
-    ps, pe = phoenix_range_days(14)
+    ps, pe = phoenix_range_days(14)  # ★ 固定 14 天
     results = []
     for oid in pos_list:
         oid = (oid or "").strip()
@@ -296,6 +298,8 @@ def fetch_orders_by_pos(pos_list, shipped: str):
             st.error(f"PO {oid} 回傳非 JSON：{r.text[:400]}"); continue
 
         raw_orders = data.get("orders") or data.get("Orders") or []
+
+        # 嚴格等於過濾 + 排除 UNSP_CG
         for o in raw_orders:
             if str(o.get("OriginalTxnId") or "").strip() == oid:
                 od = o.get("OrderDetails") or {}
@@ -455,7 +459,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "allocated_auto": "0",
         "warehouse_code": WMS_CONFIGS.get(wh_key, {}).get("WAREHOUSE_CODE", ""),
         "shipping_method": "CUSTOMER_SHIP",
-        "reference_no": test_oid,
+        "reference_no": test_oid,                     # 測試：test- + PO
         "order_desc": f"pick up: {pickup_date_str}" if pickup_date_str else "",
         "remark": "",
         "country_code": "US",
@@ -474,14 +478,14 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "email": "",
         "platform_shop": shipclass,
         "items": items,
-        "tracking_no": test_oid,
+        "tracking_no": test_oid,                      # 測試：test- + PO
     }
     return params
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-# 密碼驗證（保留）
+# 密碼驗證
 st.sidebar.subheader("🔐 驗證區")
 input_pwd = st.sidebar.text_input("請輸入密碼", type="password")
 if input_pwd != PASSWORD:
@@ -493,23 +497,22 @@ st.title(APP_TITLE)
 # 說明
 st.markdown("""
 **說明：**
-- 先在左側進行一般抓單或 PO 搜尋。
-- 之後於結果表勾選想處理的 PO，再點「BOL（先人工修改）」或「推送到 WMS（先人工修改）」進入逐筆修改與生成/送出。
-- 可能會錯，請仔細核對。
+1. 可能會錯, 請仔細核對
+2. ABCD
 """)
 
 if not TEAPPLIX_TOKEN:
     st.error("找不到 TEAPPLIX_TOKEN，請在 .env 或 Streamlit Secrets 設定。")
     st.stop()
 
-# 側邊：抓單（GET） —— 保留
+# 側邊：抓單（GET）
 days = st.sidebar.selectbox("抓取天數（一般抓單）", options=[1,2,3,4,5,6,7], index=2)
 if st.sidebar.button("抓取訂單", use_container_width=True):
     st.session_state["orders_raw"] = fetch_orders(days)
     st.session_state.pop("table_rows_override", None)
     st.sidebar.success(f"已抓取最近 {days} 天的一般訂單。")
 
-# 側邊：PO 搜尋（固定 14 天） —— 保留
+# 側邊：PO 搜尋（固定 14 天）
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔎 PO 搜尋（最近 14 天）")
 po_text = st.sidebar.text_area("輸入 PO（每行一個）", placeholder="例如：\n32585340\n46722012", height=120)
@@ -526,7 +529,7 @@ if st.sidebar.button("搜尋 PO（14 天內）", use_container_width=True):
         st.session_state.pop("table_rows_override", None)
         st.success(f"PO 搜尋完成（14 天內）：輸入 {len(pos_list)} 筆 PO，取得 {len(orders)} 筆原始訂單，並依 PO 合併顯示於下方表格。")
 
-# ======== 合併表（依 OriginalTxnId 合併） ========
+# ======== 合併表（依 OriginalTxnId 合併） + 產 BOL ========
 orders_raw = st.session_state.get("orders_raw", None)
 
 def build_table_rows_from_orders(orders_raw):
@@ -540,7 +543,7 @@ def build_table_rows_from_orders(orders_raw):
         order_date_str = _parse_order_date_str(first)
         table_rows.append({
             "Select": True,
-            # ★ 不顯示「倉庫」欄；移除所有批次倉庫功能
+            "Warehouse": "CA 91789",
             "OriginalTxnId": oid,
             "SKU8": sku8,
             "SCAC": scac,
@@ -549,64 +552,39 @@ def build_table_rows_from_orders(orders_raw):
         })
     return grouped, table_rows
 
-def _items_from_row_dict(row_dict: dict):
-    """將 row_dict 中的 Desc_i / HU_QTY_i / Pkg_QTY_i 等回推為 items list 以供人工編輯"""
-    items = []
-    idx = 1
-    while True:
-        dkey = f"Desc_{idx}"
-        if dkey not in row_dict:
-            break
-        items.append({
-            "Desc": row_dict.get(dkey, ""),
-            "HU_Type": row_dict.get(f"HU_Type_{idx}", "piece"),
-            "Pkg_Type": row_dict.get(f"Pkg_Type_{idx}", "piece"),
-            "HU_QTY": row_dict.get(f"HU_QTY_{idx}", "1"),
-            "Pkg_QTY": row_dict.get(f"Pkg_QTY_{idx}", "1"),
-            "NMFC": row_dict.get(f"NMFC{idx}", "69420"),
-            "Class": row_dict.get(f"Class{idx}", "125"),
-        })
-        idx += 1
-    if not items:
-        items = [{
-            "Desc": "",
-            "HU_Type": "piece",
-            "Pkg_Type": "piece",
-            "HU_QTY": "1",
-            "Pkg_QTY": "1",
-            "NMFC": "69420",
-            "Class": "125",
-        }]
-    return items
-
-def _row_dict_apply_items(row_dict: dict, items: list):
-    """將人工編輯後 items list 寫回 row_dict"""
-    # 先清理舊的
-    for k in list(row_dict.keys()):
-        if re.match(r"^(Desc|HU_Type|Pkg_Type|HU_QTY|Pkg_QTY)\_\d+$", k) or re.match(r"^(NMFC|Class)\d+$", k):
-            row_dict.pop(k, None)
-    # 寫回新的
-    for idx, it in enumerate(items, start=1):
-        row_dict[f"Desc_{idx}"]      = it.get("Desc", "")
-        row_dict[f"HU_Type_{idx}"]   = it.get("HU_Type", "piece")
-        row_dict[f"Pkg_Type_{idx}"]  = it.get("Pkg_Type", "piece")
-        row_dict[f"HU_QTY_{idx}"]    = str(it.get("HU_QTY", "1"))
-        row_dict[f"Pkg_QTY_{idx}"]   = str(it.get("Pkg_QTY", "1"))
-        row_dict[f"NMFC{idx}"]       = it.get("NMFC", "69420")
-        row_dict[f"Class{idx}"]      = it.get("Class", "125")
-    return row_dict
-
 if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
 
-    # 可編輯表格（無倉庫欄、無批次操作）
+    # 批次修改倉庫
+    bc1, bc2, bc3 = st.columns([1,1,6])
+    with bc1:
+        bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
+    with bc2:
+        apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
+    with bc3:
+        if st.button("套用批次倉庫"):
+            new_rows = []
+            if apply_to == "全部":
+                for r in table_rows:
+                    r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
+            else:
+                for r in table_rows:
+                    r2 = dict(r)
+                    if r2.get("Select"): r2["Warehouse"] = bulk_wh
+                    new_rows.append(r2)
+            st.session_state["table_rows_override"] = new_rows
+            table_rows = new_rows
+            st.success("已套用批次倉庫變更。")
+
+    # 可編輯表格
     edited = st.data_editor(
         st.session_state.get("table_rows_override", table_rows),
         num_rows="fixed",
         hide_index=True,
         column_config={
             "Select": st.column_config.CheckboxColumn("選取", default=True),
+            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
             "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
             "SKU8": st.column_config.TextColumn("SKU", disabled=True),
             "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
@@ -617,164 +595,70 @@ if orders_raw:
         use_container_width=True,
     )
 
-    # ======== BOL（先人工修改） ========
-    if st.button("BOL（先人工修改）", type="primary", use_container_width=True):
+    # 產出 BOL（原功能）
+    if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
         else:
-            bol_map = {}
-            default_wh_key = next(iter(WAREHOUSES.keys()))
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
+            made_files = []
             for row_preview in selected:
                 oid = row_preview["OriginalTxnId"]
+                wh_key = row_preview["Warehouse"]
                 group = grouped.get(oid, [])
                 if not group:
                     continue
-                row_dict, _wh = build_row_from_group(oid, group, default_wh_key)
-                bol_map[oid] = {"row": row_dict, "group": group}
-            st.session_state["bol_edit_map"] = bol_map
-            st.success(f"已建立 {len(bol_map)} 筆 BOL 預設資料，請在下方逐筆人工修改後生成。")
+                row_dict, WH = build_row_from_group(oid, group, wh_key)
+                sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
+                wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
+                scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
+                filename = f"BOL_{oid}_{sku8}_{wh2}_{scac}.pdf".replace(" ", "")
+                out_path = os.path.join(OUTPUT_DIR, filename)
+                fill_pdf(row_dict, out_path)
+                made_files.append(out_path)
 
-    bol_edit_map = st.session_state.get("bol_edit_map")
-    if bol_edit_map:
-        st.markdown("### 📝 BOL 推送前人工修改（逐筆）")
-        st.caption("修改欄位（含寄件端/收件端/承運資訊/件數重量/明細等），確認後再生成 BOL。")
-
-        made_files_for_zip = []
-
-        for oid, rec in bol_edit_map.items():
-            row_dict = dict(rec["row"])
-            items = _items_from_row_dict(row_dict)
-
-            with st.expander(f"📄 BOL 人工修改：{oid}", expanded=False):
-                # From / To 區塊
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.subheader("From（寄件端）")
-                    row_dict["FromName"] = st.text_input("FromName", value=row_dict.get("FromName",""), key=f"{oid}_FromName")
-                    row_dict["FromAddr"] = st.text_input("FromAddr", value=row_dict.get("FromAddr",""), key=f"{oid}_FromAddr")
-                    row_dict["FromCityStateZip"] = st.text_input("FromCityStateZip", value=row_dict.get("FromCityStateZip",""), key=f"{oid}_FromCSZ")
-                    row_dict["FromSIDNum"] = st.text_input("FromSIDNum", value=row_dict.get("FromSIDNum",""), key=f"{oid}_FromSID")
-                with c2:
-                    st.subheader("To（收件端）")
-                    row_dict["ToName"] = st.text_input("ToName", value=row_dict.get("ToName",""), key=f"{oid}_ToName")
-                    row_dict["ToAddress"] = st.text_input("ToAddress", value=row_dict.get("ToAddress",""), key=f"{oid}_ToAddress")
-                    row_dict["ToCityStateZip"] = st.text_input("ToCityStateZip", value=row_dict.get("ToCityStateZip",""), key=f"{oid}_ToCSZ")
-                    row_dict["ToCID"] = st.text_input("ToCID", value=row_dict.get("ToCID",""), key=f"{oid}_ToCID")
-
-                # 運輸資訊
-                st.subheader("承運與單號")
-                c3, c4, c5, c6 = st.columns(4)
-                with c3:
-                    row_dict["CarrierName"] = st.text_input("CarrierName", value=row_dict.get("CarrierName",""), key=f"{oid}_Carrier")
-                with c4:
-                    row_dict["SCAC"] = st.text_input("SCAC", value=row_dict.get("SCAC",""), key=f"{oid}_SCAC")
-                with c5:
-                    row_dict["PRO"] = st.text_input("PRO", value=row_dict.get("PRO",""), key=f"{oid}_PRO")
-                with c6:
-                    row_dict["BOLnum"] = st.text_input("BOLnum", value=row_dict.get("BOLnum",""), key=f"{oid}_BOLnum")
-
-                # 客戶/備註
-                st.subheader("客戶與備註")
-                c7, c8, c9 = st.columns(3)
-                with c7:
-                    row_dict["CustomerOrderNumber"] = st.text_input("CustomerOrderNumber", value=row_dict.get("CustomerOrderNumber",""), key=f"{oid}_CustNo")
-                with c8:
-                    row_dict["BillInstructions"] = st.text_input("BillInstructions", value=row_dict.get("BillInstructions",""), key=f"{oid}_BillInstr")
-                with c9:
-                    row_dict["OrderNum1"] = st.text_input("OrderNum1", value=row_dict.get("OrderNum1",""), key=f"{oid}_OrderNum1")
-                row_dict["SpecialInstructions"] = st.text_area("SpecialInstructions", value=row_dict.get("SpecialInstructions",""), key=f"{oid}_SpecInstr")
-
-                # 件數重量與日期
-                st.subheader("件數、重量與日期")
-                c10, c11, c12 = st.columns(3)
-                with c10:
-                    row_dict["TotalPkgs"] = st.text_input("TotalPkgs", value=row_dict.get("TotalPkgs",""), key=f"{oid}_TotalPkgs")
-                with c11:
-                    row_dict["Total_Weight"] = st.text_input("Total_Weight", value=row_dict.get("Total_Weight",""), key=f"{oid}_TotalWt")
-                with c12:
-                    row_dict["Date"] = st.text_input("Date", value=row_dict.get("Date",""), key=f"{oid}_Date")
-
-                # 明細（可編輯）
-                st.subheader("明細（可編輯）")
-                items_editor = st.data_editor(
-                    items,
-                    hide_index=True,
-                    key=f"{oid}_bol_items",
-                    use_container_width=True,
-                    num_rows="dynamic",
-                    column_config={
-                        "Desc": st.column_config.TextColumn("Desc"),
-                        "HU_Type": st.column_config.TextColumn("HU_Type"),
-                        "Pkg_Type": st.column_config.TextColumn("Pkg_Type"),
-                        "HU_QTY": st.column_config.TextColumn("HU_QTY"),
-                        "Pkg_QTY": st.column_config.TextColumn("Pkg_QTY"),
-                        "NMFC": st.column_config.TextColumn("NMFC"),
-                        "Class": st.column_config.TextColumn("Class"),
-                    },
-                )
-
-                # 生成此 BOL
-                if st.button("📄 生成此 BOL（PDF）", key=f"gen_bol_{oid}"):
-                    final_row = _row_dict_apply_items(dict(row_dict), items_editor)
-                    os.makedirs(OUTPUT_DIR, exist_ok=True)
-                    # 檔名：BOL_{PO}_{日期}.pdf
-                    filename = f"BOL_{oid}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf".replace(" ", "")
-                    out_path = os.path.join(OUTPUT_DIR, filename)
-                    try:
-                        fill_pdf(final_row, out_path)
-                        with open(out_path, "rb") as f:
-                            pdf_bytes = f.read()
-                        st.success(f"✅ 已生成 BOL：{filename}")
-                        st.download_button(
-                            "下載此 BOL（PDF）",
-                            data=pdf_bytes,
-                            file_name=filename,
-                            mime="application/pdf",
-                            use_container_width=True,
-                        )
-                        made_files_for_zip.append(out_path)
-                    except Exception as e:
-                        st.error(f"產生 BOL 失敗：{e}")
-
-        # 若當次有多筆成功，可合併下載
-        if made_files_for_zip:
-            mem_zip = io.BytesIO()
-            with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in made_files_for_zip:
-                    if os.path.exists(p):
+            if made_files:
+                st.success(f"已產生 {len(made_files)} 份 BOL。")
+                mem_zip = io.BytesIO()
+                with zipfile.ZipFile(mem_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for p in made_files:
                         zf.write(p, arcname=os.path.basename(p))
-            mem_zip.seek(0)
-            st.download_button(
-                "下載本次所有 BOL（ZIP）",
-                data=mem_zip,
-                file_name=f"BOL_ALL_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
+                mem_zip.seek(0)
+                st.download_button(
+                    "下載全部 BOL (ZIP)",
+                    data=mem_zip,
+                    file_name=f"BOL_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("沒有產生任何檔案。")
 
-    # ======== 推送到 WMS（先人工修改） ========
+    # ======== 新流程：推送到 WMS（先人工修改） ========
     if st.button("推送到 WMS（先人工修改）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
         else:
             edit_map = {}
-            default_wh_key = next(iter(WAREHOUSES.keys()))
             for row_preview in selected:
                 oid = row_preview["OriginalTxnId"]
+                wh_key = row_preview["Warehouse"]
                 group = grouped.get(oid, [])
                 if not group:
                     continue
-                pickup_str = default_pickup_date_str()
-                params = build_wms_params_from_group(oid, group, default_wh_key, pickup_str)
-                edit_map[oid] = {"params": params}
+                pickup_str = default_pickup_date_str()   # 預設兩天後
+                params = build_wms_params_from_group(oid, group, wh_key, pickup_str)
+                edit_map[oid] = {"Warehouse": wh_key, "params": params}
             st.session_state["wms_edit_map"] = edit_map
+            st.session_state["wms_groups"] = grouped
             st.success(f"已建立 {len(edit_map)} 筆預設上傳資料，請在下方逐筆人工修改後送出。")
 
+    # 顯示人工修改表單 + 單筆送出
     wms_edit_map = st.session_state.get("wms_edit_map")
     if wms_edit_map:
-        st.markdown("### 📝 推送前人工修改（WMS）")
+        st.markdown("### 📝 推送前人工修改")
         st.caption("每筆資料都可修改（含取件日期、SKU/數量、warehouse_code 等），確認後再送出。")
 
         for oid, rec in wms_edit_map.items():
@@ -824,14 +708,14 @@ if orders_raw:
                         "items": new_items,
                     })
 
-                    # 由 warehouse_code 反查倉別鍵（若找不到就隨機選一個）
+                    # 由 warehouse_code 反查倉別鍵（或保留原來選的倉）
                     target_wh_key = None
                     for k, cfg in WMS_CONFIGS.items():
                         if cfg.get("WAREHOUSE_CODE") == new_params.get("warehouse_code"):
                             target_wh_key = k
                             break
                     if not target_wh_key:
-                        target_wh_key = next(iter(WMS_CONFIGS.keys()))
+                        target_wh_key = rec.get("Warehouse", "NJ 08816")
 
                     cfg = WMS_CONFIGS.get(target_wh_key, {})
                     endpoint = cfg.get("ENDPOINT_URL","").strip()
@@ -846,14 +730,17 @@ if orders_raw:
                             text2 = resp2.text[:5000]
                             st.text_area("回應（前 5000 字）", text2, height=160)
 
+                            # 嘗試抓 JSON 片段並判斷成功與否
                             parsed2 = _try_extract_json(text2)
                             if parsed2:
                                 st.json(parsed2)
+                                # 成功條件：ask=Success 或 error_code=0
                                 if (str(parsed2.get("ask", "")).lower() == "success") or (str(parsed2.get("error_code", "")) == "0"):
                                     st.success("✅ WMS 上傳成功！")
                                 else:
                                     st.warning("⚠️ WMS 回傳非成功狀態，請檢查上方 JSON/回應內容。")
                             else:
+                                # 沒抓到 JSON，但若關鍵字含 Success 也當成功提示
                                 if ("\"ask\":\"Success\"" in text2) or ("\"message\":\"Success\"" in text2):
                                     st.success("✅ WMS 上傳成功！")
                                 else:
