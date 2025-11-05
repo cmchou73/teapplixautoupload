@@ -473,23 +473,25 @@ if orders:
                         try:
                             text2 = resp2.text
                             st.code(text2[:2000])
-                            # 盡量通吃各家格式：JSON/字串 + ask=Success / error_code=0
                             parsed2 = None
                             try:
                                 parsed2 = resp2.json()
                             except Exception:
                                 parsed2 = None
+
                             if parsed2:
                                 if (str(parsed2.get("ask", "")).lower() in ("success","ok","true")) or (str(parsed2.get("error_code", "")) == "0"):
                                     st.success("✅ WMS 上傳成功！")
                                 else:
                                     st.warning("⚠️ WMS 回傳非成功狀態，請檢查上方 JSON/回應內容。")
                             else:
-                                # 沒抓到 JSON，但若關鍵字含 Success 也當成功提示
                                 if ("\"ask\":\"Success\"" in text2) or ("\"message\":\"Success\"" in text2):
                                     st.success("✅ WMS 上傳成功！")
                                 else:
                                     st.info(f"HTTP {resp2.status_code}，請檢查回應內容。")
+                        except Exception as e:
+                            st.error(f"解析回應時出錯：{e}")
+
 
 # 收尾提示
 else:
