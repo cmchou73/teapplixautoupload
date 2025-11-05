@@ -543,7 +543,7 @@ def build_table_rows_from_orders(orders_raw):
         order_date_str = _parse_order_date_str(first)
         table_rows.append({
             "Select": True,
-            "Warehouse": "CA 91789",
+            "Warehouse": "— 選擇倉庫 —",  # ← 不預設，改成必選 placeholder
             "OriginalTxnId": oid,
             "SKU8": sku8,
             "SCAC": scac,
@@ -556,44 +556,47 @@ if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
     st.caption(f"共 {len(table_rows)} 筆（依 OriginalTxnId 合併）")
 
-    # 批次修改倉庫
-    bc1, bc2, bc3 = st.columns([1,1,6])
-    with bc1:
-        bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
-    with bc2:
-        apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
-    with bc3:
-        if st.button("套用批次倉庫"):
-            new_rows = []
-            if apply_to == "全部":
-                for r in table_rows:
-                    r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
-            else:
-                for r in table_rows:
-                    r2 = dict(r)
-                    if r2.get("Select"): r2["Warehouse"] = bulk_wh
-                    new_rows.append(r2)
-            st.session_state["table_rows_override"] = new_rows
-            table_rows = new_rows
-            st.success("已套用批次倉庫變更。")
+    ## 批次修改倉庫
+    #bc1, bc2, bc3 = st.columns([1,1,6])
+    #with bc1:
+    #    bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
+    #with bc2:
+    #    apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
+    #with bc3:
+    #    if st.button("套用批次倉庫"):
+    #        new_rows = []
+    #        if apply_to == "全部":
+    #            for r in table_rows:
+    #                r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
+    #        else:
+    #            for r in table_rows:
+    #                r2 = dict(r)
+    #                if r2.get("Select"): r2["Warehouse"] = bulk_wh
+    #                new_rows.append(r2)
+    #        st.session_state["table_rows_override"] = new_rows
+    #        table_rows = new_rows
+    #        st.success("已套用批次倉庫變更。")
 
     # 可編輯表格
     edited = st.data_editor(
-        st.session_state.get("table_rows_override", table_rows),
-        num_rows="fixed",
-        hide_index=True,
-        column_config={
-            "Select": st.column_config.CheckboxColumn("選取", default=True),
-            "Warehouse": st.column_config.SelectboxColumn("倉庫", options=list(WAREHOUSES.keys())),
-            "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
-            "SKU8": st.column_config.TextColumn("SKU", disabled=True),
-            "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
-            "ToState": st.column_config.TextColumn("州", disabled=True),
-            "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
-        },
-        key="orders_table",
-        use_container_width=True,
-    )
+    st.session_state.get("table_rows_override", table_rows),
+    num_rows="fixed",
+    hide_index=True,
+    column_config={
+        "Select": st.column_config.CheckboxColumn("選取", default=True),
+        "Warehouse": st.column_config.SelectboxColumn(
+            "倉庫",
+            options=["— 選擇倉庫 —"] + list(WAREHOUSES.keys())  # ← 必選
+        ),
+        "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
+        "SKU8": st.column_config.TextColumn("SKU", disabled=True),
+        "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
+        "ToState": st.column_config.TextColumn("州", disabled=True),
+        "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
+    },
+    key="orders_table",
+    use_container_width=True,
+)
 
     # 產出 BOL（原功能）
     if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
@@ -601,22 +604,27 @@ if orders_raw:
         if not selected:
             st.warning("尚未選取任何訂單。")
         else:
-            os.makedirs(OUTPUT_DIR, exist_ok=True)
-            made_files = []
-            for row_preview in selected:
-                oid = row_preview["OriginalTxnId"]
-                wh_key = row_preview["Warehouse"]
-                group = grouped.get(oid, [])
-                if not group:
-                    continue
-                row_dict, WH = build_row_from_group(oid, group, wh_key)
-                sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
-                wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
-                scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
-                filename = f"BOL_{oid}_{sku8}_{wh2}_{scac}.pdf".replace(" ", "")
-                out_path = os.path.join(OUTPUT_DIR, filename)
-                fill_pdf(row_dict, out_path)
-                made_files.append(out_path)
+            # ← 新增必填檢查
+            missing = [r["OriginalTxnId"] for r in selected if r.get("Warehouse") in (None, "", "— 選擇倉庫 —")]
+            if missing:
+                st.error(f"以下 PO 未選倉庫，請先選擇倉庫：{', '.join(missing)}")
+            else:
+                os.makedirs(OUTPUT_DIR, exist_ok=True)
+                made_files = []
+                for row_preview in selected:
+                    oid = row_preview["OriginalTxnId"]
+                    wh_key = row_preview["Warehouse"]
+                    group = grouped.get(oid, [])
+                    if not group:
+                        continue
+                    row_dict, WH = build_row_from_group(oid, group, wh_key)
+                    sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
+                    wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
+                    scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
+                    filename = f"BOL_{oid}_{sku8}_{wh2}_{scac}.pdf".replace(" ", "")
+                    out_path = os.path.join(OUTPUT_DIR, filename)
+                    fill_pdf(row_dict, out_path)
+                    made_files.append(out_path)
 
             if made_files:
                 st.success(f"已產生 {len(made_files)} 份 BOL。")
