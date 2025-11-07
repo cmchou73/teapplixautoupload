@@ -349,7 +349,7 @@ def build_row_from_group(oid, group, wh_key: str):
     custom_code = (od.get("Custom") or "").strip()
 
     total_pkgs, total_lb = _sum_group_totals(group)
-    #bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
+    bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
 
     WH = WAREHOUSES.get(wh_key, list(WAREHOUSES.values())[0])
 
@@ -366,7 +366,8 @@ def build_row_from_group(oid, group, wh_key: str):
         "FromCityStateZip": WH["citystatezip"],
         "FromSIDNum": WH["sid"],
         "3rdParty": "X", "PrePaid": "", "Collect": "",
-        "BOLnum": bol_num,
+        #"BOLnum": bol_num,
+        "BOLnum": "",
         "CarrierName": carrier_name_final,
         "SCAC": scac_from_shipclass,
         "PRO": tracking.get("TrackingNumber", ""),
