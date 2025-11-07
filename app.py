@@ -485,7 +485,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     # 依倉庫 + items 規則決定 shipping_method
     shipping_method = decide_shipping_method(wh_key, items)
 
-    test_oid = f"test1-{oid}".strip()
+    test_oid = f"{oid}".strip()
 
     params = {
         "platform": "OTHER",
@@ -511,7 +511,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "email": "",
         "platform_shop": shipclass,
         "items": items,                               # ← 使用聚合後的 SKU/數量
-        "tracking_no": test_oid,                      # 測試：test- + PO
+        "tracking_no": "",                      # 測試：test- + PO
     }
     return params
 
