@@ -233,6 +233,40 @@ def _try_extract_json(resp_text: str):
         except Exception:
             return {}
 
+# ---------- BOL 產號工具 ----------
+def luhn_check_digit(number_without_check: str) -> str:
+    """
+    回傳 Luhn 校驗碼（單一數字字元）。
+    number_without_check 須為數字字串（長度任意）；此函式不做長度檢查。
+    """
+    s = number_without_check[::-1]
+    total = 0
+    for i, ch in enumerate(s, start=1):
+        d = ord(ch) - 48  # '0' -> 48
+        if (i % 2) == 1:
+            # 反向序列中奇數位（原字串從右數的偶數位）→ 加倍
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    check = (10 - (total % 10)) % 10
+    return str(check)
+
+def build_bol_number(oid: str) -> str:
+    """
+    規則：
+      1) 固定前 9 碼：081003089
+      2) 接上 oid 的數字（去除非數字）
+      3) 右側補 0，直到長度達 19
+      4) 第 20 碼為 Luhn 校驗碼
+    """
+    prefix = "081003089"
+    oid_digits = re.sub(r"\D", "", f"{oid or ''}")
+    base = (prefix + oid_digits)[:19]      # 超過則截斷到 19
+    base = base.ljust(19, "0")             # 不足則補 0 到 19
+    check = luhn_check_digit(base)
+    return base + check                    # 共 20 碼
+
 # ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
@@ -349,7 +383,9 @@ def build_row_from_group(oid, group, wh_key: str):
     custom_code = (od.get("Custom") or "").strip()
 
     total_pkgs, total_lb = _sum_group_totals(group)
-    bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
+
+    # ★ 依規則生成 20 碼 BOL
+    bol_num = build_bol_number(oid)
 
     WH = WAREHOUSES.get(wh_key, list(WAREHOUSES.values())[0])
 
@@ -366,8 +402,8 @@ def build_row_from_group(oid, group, wh_key: str):
         "FromCityStateZip": WH["citystatezip"],
         "FromSIDNum": WH["sid"],
         "3rdParty": "X", "PrePaid": "", "Collect": "",
-        #"BOLnum": bol_num,
-        "BOLnum": "",
+        # 原本空字串 → 改成 20 碼 BOL 號
+        "BOLnum": bol_num,
         "CarrierName": carrier_name_final,
         "SCAC": scac_from_shipclass,
         "PRO": tracking.get("TrackingNumber", ""),
@@ -480,12 +516,11 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     phone = (to.get("PhoneNumber") or "").strip()
     shipclass = (od.get("ShipClass") or "").strip()
 
-    # ★★★ 新增：取得 carrier_name_final，做 platform_shop 回退用
+    # ★★★ 取得 carrier_name_final，供 platform_shop 回退用
     ship_details = (first.get("ShippingDetails") or [{}])[0] or {}
     pkg = ship_details.get("Package") or {}
     tracking = pkg.get("TrackingInfo") or {}
     carrier_name_raw = (tracking.get("CarrierName") or "").strip()
-    # 以 ShipClass 當作 SCAC 嘗試覆蓋得到最終承運商名稱
     carrier_name_final = override_carrier_name_by_scac(shipclass, carrier_name_raw)
 
     # 聚合 SKU 數量
@@ -518,7 +553,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "cell_phone": "",
         "phone_extension": "",
         "email": "",
-        # ★★★ 這行就是你要的回退：先用 carrier_name_final，找不到再用 shipclass
+        # ★★★ 先用 carrier_name_final，找不到再用 shipclass
         "platform_shop": carrier_name_final or shipclass,
         "items": items,                               # ← 使用聚合後的 SKU/數量
         "tracking_no": "",                            # 測試：test- + PO
@@ -622,13 +657,13 @@ if orders_raw:
     use_container_width=True,
 )
 
-    # 產出 BOL（原功能）
+    # 產出 BOL（勾選列）
     if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
         selected = [r for r in edited if r.get("Select")]
         if not selected:
             st.warning("尚未選取任何訂單。")
         else:
-            # ← 新增必填檢查
+            # 必填檢查：倉庫
             missing = [r["OriginalTxnId"] for r in selected if r.get("Warehouse") in (None, "", "— 選擇倉庫 —")]
             if missing:
                 st.error(f"以下 PO 未選倉庫，請先選擇倉庫：{', '.join(missing)}")
