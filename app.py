@@ -510,7 +510,7 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "cell_phone": "",
         "phone_extension": "",
         "email": "",
-        "platform_shop": shipclass,
+        "platform_shop": carrier_name_final or shipclass,
         "items": items,                               # ← 使用聚合後的 SKU/數量
         "tracking_no": "",                      # 測試：test- + PO
     }
