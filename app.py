@@ -233,47 +233,6 @@ def _try_extract_json(resp_text: str):
         except Exception:
             return {}
 
-# ---------- BOL 流水號與檢核碼 ----------
-_BOL_PREFIX = "081003089"  # 前 9 碼固定
-
-def _luhn_check_digit(num_str_wo_check: str) -> int:
-    """
-    計算 Luhn (mod 10) 檢核碼。輸入為未含檢核碼的數字字串。
-    """
-    s = [int(c) for c in num_str_wo_check]
-    # 從右往左，偶數位(0-based) *2，>9 減 9
-    total = 0
-    reverse = list(reversed(s))
-    for i, d in enumerate(reverse):
-        if i % 2 == 0:
-            total += d
-        else:
-            dd = d * 2
-            if dd > 9:
-                dd -= 9
-            total += dd
-    return (10 - (total % 10)) % 10
-
-def _make_bol_number_by_seq(seq: int) -> str:
-    """
-    依序號產生 20 碼 BOL：
-      1-9:  固定前綴 "081003089"
-      10-19: 連號（從 1 起，左側補零到 10 碼）
-      20: Luhn 檢核碼（以前 19 碼計算）
-    """
-    body = _BOL_PREFIX + f"{seq:010d}"
-    check = _luhn_check_digit(body)
-    return body + str(check)
-
-def next_bol_number() -> str:
-    """
-    取得下一個不重複 BOL 編號（存在 session_state 裡確保同場次不重複）
-    """
-    seq = st.session_state.get("bol_seq", 1)
-    code = _make_bol_number_by_seq(seq)
-    st.session_state["bol_seq"] = seq + 1
-    return code
-
 # ---------- API：抓取一般訂單（GET） ----------
 def fetch_orders(days: int):
     ps, pe = phoenix_range_days(days)
@@ -390,6 +349,7 @@ def build_row_from_group(oid, group, wh_key: str):
     custom_code = (od.get("Custom") or "").strip()
 
     total_pkgs, total_lb = _sum_group_totals(group)
+    bol_num = (od.get("Invoice") or "").strip() or (oid or "").strip()
 
     WH = WAREHOUSES.get(wh_key, list(WAREHOUSES.values())[0])
 
@@ -406,13 +366,13 @@ def build_row_from_group(oid, group, wh_key: str):
         "FromCityStateZip": WH["citystatezip"],
         "FromSIDNum": WH["sid"],
         "3rdParty": "X", "PrePaid": "", "Collect": "",
-        # "BOLnum": 會在產生 PDF 前以 next_bol_number() 動態填入
+        #"BOLnum": bol_num,
         "BOLnum": "",
         "CarrierName": carrier_name_final,
         "SCAC": scac_from_shipclass,
         "PRO": tracking.get("TrackingNumber", ""),
         "CustomerOrderNumber": custom_code,
-        "BillInstructions": f"PO#{oid or custom_code}",
+        "BillInstructions": f"PO#{oid or bol_num}",
         "OrderNum1": custom_code,
         "SpecialInstructions": "",
         "TotalPkgs": str(total_pkgs) if total_pkgs else "",
@@ -520,13 +480,6 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     phone = (to.get("PhoneNumber") or "").strip()
     shipclass = (od.get("ShipClass") or "").strip()
 
-    # 取 TrackingInfo.CarrierName 作為 current_name；若沒有再用 shipclass
-    ship_details = (first.get("ShippingDetails") or [{}])[0] or {}
-    pkg = ship_details.get("Package") or {}
-    tracking = pkg.get("TrackingInfo") or {}
-    carrier_name_raw = (tracking.get("CarrierName") or "").strip()
-    platform_shop_value = carrier_name_raw if carrier_name_raw else shipclass
-
     # 聚合 SKU 數量
     items = _aggregate_items_by_sku(group)
 
@@ -557,9 +510,9 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "cell_phone": "",
         "phone_extension": "",
         "email": "",
-        "platform_shop": platform_shop_value,         # ★ 改為 CarrierName（若無則 ShipClass）
+        "platform_shop": shipclass,
         "items": items,                               # ← 使用聚合後的 SKU/數量
-        "tracking_no": "",                            # 測試：test- + PO
+        "tracking_no": "",                      # 測試：test- + PO
     }
     return params
 
@@ -639,26 +592,47 @@ if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
     st.caption(f"共 {len(table_rows)} 筆")
 
+    ## 批次修改倉庫
+    #bc1, bc2, bc3 = st.columns([1,1,6])
+    #with bc1:
+    #    bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
+    #with bc2:
+    #    apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
+    #with bc3:
+    #    if st.button("套用批次倉庫"):
+    #        new_rows = []
+    #        if apply_to == "全部":
+    #            for r in table_rows:
+    #                r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
+    #        else:
+    #            for r in table_rows:
+    #                r2 = dict(r)
+    #                if r2.get("Select"): r2["Warehouse"] = bulk_wh
+    #                new_rows.append(r2)
+    #        st.session_state["table_rows_override"] = new_rows
+    #        table_rows = new_rows
+    #        st.success("已套用批次倉庫變更。")
+
     # 可編輯表格
     edited = st.data_editor(
-        st.session_state.get("table_rows_override", table_rows),
-        num_rows="fixed",
-        hide_index=True,
-        column_config={
-            "Select": st.column_config.CheckboxColumn("選取", default=True),
-            "Warehouse": st.column_config.SelectboxColumn(
-                "倉庫",
-                options=["— 選擇倉庫 —"] + list(WAREHOUSES.keys())  # ← 必選
-            ),
-            "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
-            "SKU8": st.column_config.TextColumn("SKU", disabled=True),
-            "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
-            "ToState": st.column_config.TextColumn("州", disabled=True),
-            "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
-        },
-        key="orders_table",
-        use_container_width=True,
-    )
+    st.session_state.get("table_rows_override", table_rows),
+    num_rows="fixed",
+    hide_index=True,
+    column_config={
+        "Select": st.column_config.CheckboxColumn("選取", default=True),
+        "Warehouse": st.column_config.SelectboxColumn(
+            "倉庫",
+            options=["— 選擇倉庫 —"] + list(WAREHOUSES.keys())  # ← 必選
+        ),
+        "OriginalTxnId": st.column_config.TextColumn("PO", disabled=True),
+        "SKU8": st.column_config.TextColumn("SKU", disabled=True),
+        "SCAC": st.column_config.TextColumn("SCAC", disabled=True),
+        "ToState": st.column_config.TextColumn("州", disabled=True),
+        "OrderDate": st.column_config.TextColumn("訂單日期 (mm/dd/yy)", disabled=True),
+    },
+    key="orders_table",
+    use_container_width=True,
+)
 
     # 產出 BOL（原功能）
     if st.button("產生 BOL（勾選列）", type="primary", use_container_width=True):
@@ -680,10 +654,9 @@ if orders_raw:
                     if not group:
                         continue
                     row_dict, WH = build_row_from_group(oid, group, wh_key)
-
-                    # ★ 這裡動態產生 20 碼 BOL
-                    row_dict["BOLnum"] = next_bol_number()
-
+                    sku8 = row_preview["SKU8"] or (_sku8_from_order(group[0]) or "NOSKU")[:8]
+                    wh2 = (WH["name"][:2].upper() if WH["name"] else "WH")
+                    scac = (row_preview["SCAC"] or "").upper() or "NOSCAC"
                     filename = f"{oid}.pdf".replace(" ", "")
                     out_path = os.path.join(OUTPUT_DIR, filename)
                     fill_pdf(row_dict, out_path)
