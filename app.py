@@ -480,6 +480,14 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
     phone = (to.get("PhoneNumber") or "").strip()
     shipclass = (od.get("ShipClass") or "").strip()
 
+    # ★★★ 新增：取得 carrier_name_final，做 platform_shop 回退用
+    ship_details = (first.get("ShippingDetails") or [{}])[0] or {}
+    pkg = ship_details.get("Package") or {}
+    tracking = pkg.get("TrackingInfo") or {}
+    carrier_name_raw = (tracking.get("CarrierName") or "").strip()
+    # 以 ShipClass 當作 SCAC 嘗試覆蓋得到最終承運商名稱
+    carrier_name_final = override_carrier_name_by_scac(shipclass, carrier_name_raw)
+
     # 聚合 SKU 數量
     items = _aggregate_items_by_sku(group)
 
@@ -510,9 +518,10 @@ def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_
         "cell_phone": "",
         "phone_extension": "",
         "email": "",
+        # ★★★ 這行就是你要的回退：先用 carrier_name_final，找不到再用 shipclass
         "platform_shop": carrier_name_final or shipclass,
         "items": items,                               # ← 使用聚合後的 SKU/數量
-        "tracking_no": "",                      # 測試：test- + PO
+        "tracking_no": "",                            # 測試：test- + PO
     }
     return params
 
@@ -591,27 +600,6 @@ def build_table_rows_from_orders(orders_raw):
 if orders_raw:
     grouped, table_rows = build_table_rows_from_orders(orders_raw)
     st.caption(f"共 {len(table_rows)} 筆")
-
-    ## 批次修改倉庫
-    #bc1, bc2, bc3 = st.columns([1,1,6])
-    #with bc1:
-    #    bulk_wh = st.selectbox("批次指定倉庫", options=list(WAREHOUSES.keys()), index=0)
-    #with bc2:
-    #    apply_to = st.selectbox("套用對象", options=["勾選列", "全部"], index=0)
-    #with bc3:
-    #    if st.button("套用批次倉庫"):
-    #        new_rows = []
-    #        if apply_to == "全部":
-    #            for r in table_rows:
-    #                r2 = dict(r); r2["Warehouse"] = bulk_wh; new_rows.append(r2)
-    #        else:
-    #            for r in table_rows:
-    #                r2 = dict(r)
-    #                if r2.get("Select"): r2["Warehouse"] = bulk_wh
-    #                new_rows.append(r2)
-    #        st.session_state["table_rows_override"] = new_rows
-    #        table_rows = new_rows
-    #        st.success("已套用批次倉庫變更。")
 
     # 可編輯表格
     edited = st.data_editor(
