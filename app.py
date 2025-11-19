@@ -159,11 +159,11 @@ def _first_item(order):
     return {}
 
 def _desc_value_from_order(order):
-    sku = (_first_item(order).get("ItemCustom") or _first_item(order).get("ItemSKU"))
+    sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
     return f"{sku}  (Electric Fireplace)".strip()
 
 def _sku8_from_order(order):
-    sku = (_first_item(order).get("ItemCustom") or _first_item(order).get("ItemSKU"))
+    sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
     return sku[:8] if sku else ""
 
 def _qty_from_order(order):
@@ -460,7 +460,7 @@ def _aggregate_items_by_sku(group):
         if isinstance(items, dict):
             items = [items]
         for it in items:
-            sku = (it.get("ItemCustom") or it.get("ItemSKU")).strip()
+            sku = (it.get("ItemSKU") or it.get("ItemCustom")).strip()
             if not sku:
                 continue
             try:
