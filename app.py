@@ -162,8 +162,9 @@ def _first_item(order):
 
 def _desc_value_from_order(order):
     sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
-    #dec = _first_item(order).get("Description")
+    dec = (_first_item(order).get("Description") or _first_item(order).get("Amount"))
     return f"{sku}  (Electric Fireplace)".strip()
+    return f"{dec}  (Electric Fireplace)".strip()
 
 def _sku8_from_order(order):
     sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
