@@ -161,10 +161,16 @@ def _first_item(order):
     return {}
 
 def _desc_value_from_order(order):
-    sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
-    dec = _first_item(order).get("Description")
+    #sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
+    #dec = _first_item(order).get("Description")
     #return f"{sku}  (Electric Fireplace)".strip()
-    return f"{dec}".strip()
+    first_item = _first_item(order)
+    print("DEBUG first_item:", first_item)  # <--- 先看看回傳的內容
+    sku = first_item.get("ItemSKU") or first_item.get("ItemCustom")
+    dec = first_item.get("Description", "")  # 加上預設值避免 None
+    print("DEBUG dec:", dec)
+    return dec.strip()
+
     
 def _sku8_from_order(order):
     sku = (_first_item(order).get("ItemSKU") or _first_item(order).get("ItemCustom"))
