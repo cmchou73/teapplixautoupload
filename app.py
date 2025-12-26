@@ -490,7 +490,7 @@ def decide_shipping_method(wh_key: str, items: list[dict]) -> str:
     """
     wh_key = (wh_key or "").strip()
     if wh_key == "NJ 08816":
-        return "CUSTOMER_SHIP"
+        return "CUSTOMER-LTL"
 
     if wh_key == "CA 91789":
         # items 結構來自 _aggregate_items_by_sku：
@@ -502,7 +502,7 @@ def decide_shipping_method(wh_key: str, items: list[dict]) -> str:
         return "ALL_SELF_LTL"
 
     # 預設：未指定規則的倉別
-    return "CUSTOMER_SHIP"
+    return "CUSTOMER-LTL"
 
 
 def build_wms_params_from_group(oid: str, group: list, wh_key: str, pickup_date_str: str) -> dict:
